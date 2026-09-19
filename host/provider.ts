@@ -32,6 +32,8 @@ export class MapProvider {
   private vectors = new Map<string, { value: PreparedTile; expires: number }>();
   private preparing = new Map<string, Promise<PreparedTile>>();
   private meshBytes = 0;
+  private decodedHits = 0;
+  private preparedHits = 0;
   private searching = false;
   private nextSearch = 0;
   constructor(
@@ -53,11 +55,14 @@ export class MapProvider {
       (!Number.isInteger(config.dataZoom ?? 14) || (config.dataZoom ?? 14) < 0 || (config.dataZoom ?? 14) > 14)
     )
       throw new Error("Invalid vector source zoom");
+    const rendition = config.format === "vector" ? "mesh-shortbread-v1" : "r5g6b5-v1";
+    const sha = (value: unknown) => createHash("sha256").update(JSON.stringify(value)).digest("hex").slice(0, 16);
     this.info = {
-      source: createHash("sha256")
-        .update(JSON.stringify([config.tileURL, config.format === "vector" ? "mesh-shortbread-v1" : "r5g6b5-v1"]))
-        .digest("hex")
-        .slice(0, 16),
+      source: sha([config.tileURL, rendition]),
+      // Relay revision (draft §3.5): the source identity extended by the
+      // operator epoch. A resident guest tile revalidates with ifRevision and
+      // is re-transferred only when this value moved.
+      revision: sha([config.tileURL, rendition, config.revision ?? ""]),
       name: config.name.slice(0, 40),
       attribution: config.attribution.slice(0, 100),
       maxZoom: config.maxZoom,
@@ -104,6 +109,7 @@ export class MapProvider {
     const key = `${z}/${x}/${y}`,
       hit = this.decoded.get(key);
     if (hit && hit.expires > Date.now()) {
+      this.decodedHits++;
       this.decoded.delete(key);
       this.decoded.set(key, hit);
       return Promise.resolve(hit.image);
@@ -139,6 +145,7 @@ export class MapProvider {
     const key = `${z}/${x}/${y}`,
       hit = this.vectors.get(key);
     if (hit && hit.expires > Date.now()) {
+      this.preparedHits++;
       this.vectors.delete(key);
       this.vectors.set(key, hit);
       return Promise.resolve(hit.value);
@@ -282,6 +289,8 @@ export class MapProvider {
     return {
       httpHits: this.cache.hits,
       downloads: this.cache.downloads,
+      decodedHits: this.decodedHits,
+      preparedHits: this.preparedHits,
       meshBytes: this.meshBytes,
       prepared: this.vectors.size,
     };

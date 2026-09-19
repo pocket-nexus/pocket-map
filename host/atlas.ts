@@ -30,7 +30,11 @@ export class AtlasProvider {
       this.db.close(); throw new Error("Incomplete Hyrule atlas; run bun run prepare:hyrule");
     }
     if (existsSync(join(directory, "markers.sqlite"))) this.markers = new MarkerIndex(join(directory, "markers.sqlite"));
-    this.info = { ...manifest.info, markers: !!this.markers };
+    // The atlas revision (the pinned upstream map revision) is the relay
+    // content revision of every tile in this namespace; a rebuilt atlas is a
+    // new revision and invalidates resident guest tiles through one
+    // namespace-scope INVALIDATE.
+    this.info = { ...manifest.info, revision: manifest.revision || manifest.info.source, markers: !!this.markers };
     this.bookmarks = new Bookmarks(join(directory, "places.sqlite"));
   }
   methods() { return {

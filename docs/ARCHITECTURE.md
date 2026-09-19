@@ -83,6 +83,27 @@ ownership have different roles. An old zoom layer retains loaded resources
 while the new layer demands current tiles. It never requests an unseen parent
 pyramid or downloads a city in advance.
 
+## Relay transport (pilot)
+
+With `transport: "relay"` the four read paths of the lifecycle above
+(`map.tile`, `map.mesh`, `map.markers`, `map.label`) are relay resources; the
+collections, budgets and eviction are unchanged, only the loader differs.
+
+| Piece | Offload (default) | Relay |
+| --- | --- | --- |
+| Identity | method + JSON payload, cache key `source/z/x/y` | `ResourceRef{kind, ns: map/<source>, key: z/x/y, rendition, revision}`; the cache key is the same string |
+| Request | `requestImage` / `requestMesh` / `request`, one credit of eight | `resource.get` with `accept`, `maxObjectBytes` and the held `ifRevision`; six of eight request slots (two reserved for control) |
+| Transfer | one 131,088-byte PIMG or PMSH record | three 65,536-byte chunks (raster), one chunk (mesh, markers, label); digest-checked, published once |
+| Withdrawal | callback dropped; the reply still arrives and returns credit | `CANCEL` on the sideband; the provider answers `CANCELLED/none` unless the object already entered its send queue |
+| Reconnect | every tile re-requested | every resident tile revalidated with `ifRevision`: `notModified`, about 1.1 KB per tile |
+| Source change | host restart; new source hash | one namespace-scope `INVALIDATE`; in-flight replies stamped with the old revision are fenced (`RESYNC_REQUIRED`) and resident tiles refetch |
+| Host process | `host/worker.ts` behind the offload provider | the same worker module behind `host/relay-host.ts` (`MapRelayAuthority`), TCP listener from `tools/relay-wire.ts` |
+
+Namespace scope is the one invalidation the authority can send in one frame
+for a moved source: key scope would need one frame per resident key it does not
+know about, and revision scope names one concrete (key, revision). The guest
+keeps drawing the stale tiles and refetches them.
+
 ## Transport recovery
 
 **The Mac connection manager does not import the native canvas module.** It

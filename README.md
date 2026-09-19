@@ -183,6 +183,34 @@ z18; street-label windows query the same prepared source data.
 Custom 256px PNG endpoints remain supported with `"format": "raster"`. Hyrule's
 complete local JPEG-derived atlas stays on the R5G6B5 image path.
 
+## Relay transport (pilot)
+
+Tiles, meshes, marker windows and rendered labels can travel over
+[PocketJS Relay](https://github.com/pocket-stack/pocketjs/blob/main/docs/RELAY.md)
+instead of offload method calls. `map.info`, search and saved places stay on
+offload in both modes; the switch is explicit and defaults to offload.
+
+- Host: `transport: "relay"` in `.local/provider.json`, or `bun run host <3ds-ip> --relay`.
+  The Mac then also listens on `relayPort` (default 8742) and the device dials
+  it, presenting the same pairing key before its HELLO. The offload provider
+  keeps dialing the device for the remaining methods. `SIGHUP` re-reads the
+  provider configuration into a fresh worker and announces a moved source
+  revision to every connected device with one namespace `INVALIDATE`.
+- Guest: `createMap(io, viewport, entries, { transport: "relay", relay })`
+  with a relay map client (`app/relay.ts`) over the device's byte channel.
+  The 3DS and PSP builds have no native relay channel yet, so their compiled
+  guests keep the offload default; the relay path is exercised headless
+  (`test/relay-*.test.ts`) and over a TCP loopback.
+
+Resource identity: `kind` tile or texture, `ns` = `map/<source hash>`,
+`key` = `z/x/y` (labels: the JSON text pair), `rendition` = `r5g6b5-v1`,
+`mesh-shortbread-v1`, `markers-<layer>-v1` or `label-r5g6b5-256x32-v1`,
+`revision` = the atlas revision or the OSM source hash extended by the
+operator `revision` epoch. A tile held with its revision revalidates with
+`ifRevision` (a `notModified` terminal instead of 131,072 bytes); a tile
+scrolled out of view is withdrawn with `CANCEL`, and a provider slower than
+one frame answers a small `CANCELLED` terminal instead of the object.
+
 ## Architecture and resource pattern
 
 The app defines separate image and geometry collections. Both use the same
