@@ -2,17 +2,22 @@ import { expect, test } from "bun:test";
 import { createRoot } from "solid-js";
 import { createResourceView } from "@pocketjs/framework/resource-view";
 import { RELAY_ERROR } from "@pocketjs/framework/relay/spec";
-import { MAP_RELAY } from "../shared/relay.ts";
+import { MAP_RELAY, namespaceFor, streamWindow } from "../shared/relay.ts";
 import type { Place, TileInput } from "../shared/types.ts";
-import { createRig, rasterService, type Fixture, type Transport } from "./relay-rig.ts";
+import { createRig, rasterService, RASTER_URL_ALT, type Fixture, type Transport } from "./relay-rig.ts";
 
 const receipt = (name: string, value: unknown) => console.log(`RECEIPT ${name} ${JSON.stringify(value)}`);
 const keyOf = (t: TileInput) => `${t.z}/${t.x}/${t.y}`;
 const handleOf = (state: { status: string; value?: unknown }) => state.status === "ready" ? (state.value as { handle: number }).handle : -1;
 const same = (a?: Uint8Array, b?: Uint8Array) => !!a && !!b && a.length === b.length && Buffer.compare(Buffer.from(a), Buffer.from(b)) === 0;
-/** The negotiated per-stream window slice: the attachment window minus the
- * stream-0 control quarter (framework relayControlSlice/relayStreamSlice). */
-const SLICE = { frames: MAP_RELAY.rxLimits.windowFrames - Math.min(8, Math.floor(MAP_RELAY.rxLimits.windowFrames / 4)), bytes: MAP_RELAY.rxLimits.windowBytes - Math.min(32768, Math.floor(MAP_RELAY.rxLimits.windowBytes / 4)) };
+/** The per-stream window a map source's OPEN asks for (shared/relay.ts
+ * streamWindow): the attachment minus stream 0's control quarter and the
+ * catalog stream, split between the two sources the catalog can list. */
+const MAP_STREAM = streamWindow(MAP_RELAY.rxLimits, namespaceFor("0".repeat(16)));
+const SLICE = { frames: MAP_STREAM.windowFrames, bytes: MAP_STREAM.windowBytes };
+/** The in-flight ceiling task 1130 measured and task 1151 reproduced; this
+ * migration may not widen it. */
+const EVIDENCE_CAP = { frames: 6, bytes: 229376 };
 const LABEL: Place = { id: "label:1", name: "日本橋", detail: "", lat: 0, lon: 0, zoom: 14 };
 
 /** Frame hooks are process-global, so the two transports run one after the
@@ -33,12 +38,16 @@ async function screen(transport: Transport, fixture: Fixture) {
     const markers = r.model.annotations.rows();
     const relay = r.relayStats(), totals = r.wireTotals(), offload = r.offloadStats();
     if (transport === "relay") {
-      // Nothing but map.info crossed offload; every read was a resource, and the link is quiet at the end.
-      expect(Object.keys(offload.byMethod)).toEqual(["map.info"]);
+      // No map read crossed offload: the catalog (map.info), tiles, meshes,
+      // markers, labels and search are all relay resources now. Saved places
+      // are mutations and stay on offload (#437 pilot order).
+      expect(Object.keys(offload.byMethod).filter(m => m.startsWith("map."))).toEqual([]);
       expect(relay!.protocolErrors).toBe(0); expect(r.providerEndpoint!.protocolErrors).toBe(0);
       expect(relay!.pending).toBe(0); expect(relay!.staged).toBe(0);
       expect(r.samples.providerInFlightFrames).toBeLessThanOrEqual(SLICE.frames);
       expect(r.samples.providerInFlightBytes).toBeLessThanOrEqual(SLICE.bytes);
+      expect(r.samples.providerInFlightFrames).toBeLessThanOrEqual(EVIDENCE_CAP.frames);
+      expect(r.samples.providerInFlightBytes).toBeLessThanOrEqual(EVIDENCE_CAP.bytes);
     }
     const perTile = (n: number) => Math.round(n / tiles.length);
     const summary = transport === "offload"
@@ -87,7 +96,9 @@ test("a relay reconnect revalidates every resident tile with ifRevision: notModi
     const revalidated = after.notModified - before.notModified, transferred = after.objects - before.objects;
     receipt("reconnect", { residentEntries: r.model.tiles.stats().entries, revalidated, transferred, frames, bytesDuringReconnect: wireAfter.bytes - wireBefore.bytes, bytesPerRevalidation: Math.round((wireAfter.bytes - wireBefore.bytes) / revalidated), sessions: after.sessions, resync: after.errorCodes[RELAY_ERROR.RESYNC_REQUIRED] ?? 0 });
     expect(after.sessions).toBe(2);
-    expect(revalidated).toBe(r.model.tiles.stats().entries);
+    // The resident tiles plus the catalog document: the held revisions
+    // survive the session, so a reconnect costs one notModified each.
+    expect(revalidated).toBe(r.model.tiles.stats().entries + 1);
     expect(transferred).toBe(0);
     expect(pendingSeen).toBe(0);
     expect(tiles.map(t => handleOf(r.model.frontView.state(t)))).toEqual(handles);
@@ -146,6 +157,55 @@ test("a moved source revision: resident tiles are refetched, the gets in flight 
   } finally { r.dispose(); }
 }, 60000);
 
+test("a reload that replaces the source moves map.info, the revision and the namespace together: the guest follows the catalog and never mixes the two", async () => {
+  const r = await createRig({ transport: "relay", fixture: "raster", latency: 2 });
+  try {
+    await r.until(() => !!r.model.info(), 120);
+    await r.until(r.screenReady, 900);
+    await r.frames(10);
+    const oldSource = r.model.info()!.source, oldNs = namespaceFor(oldSource);
+    const oldCatalog = r.model.catalog()!.revision;
+    const oldBytes = new Map(r.model.front()!.tiles.map(t => [keyOf(t.input), r.tileBytes(t.input)!.slice()]));
+    expect(r.authority!.sourceList().map(s => s.ns)).toEqual([oldNs]);
+    // The operator points the host at a different tile URL and SIGHUPs it:
+    // the authority reads map.info from the new worker, then publishes
+    // backend, source table and catalog in one step.
+    const reload = await r.reload("2", epoch => rasterService(epoch, RASTER_URL_ALT));
+    const newSource = reload.sources[0].source, newNs = namespaceFor(newSource);
+    expect(newSource).not.toBe(oldSource);
+    expect(reload.catalog.revision).not.toBe(oldCatalog);
+    // The old namespace is gone from the authority; the catalog names only the new one.
+    expect(r.authority!.source(oldNs)).toBeUndefined();
+    expect(reload.catalog.maps.map(m => m.source)).toEqual([newSource]);
+    // The guest learns it on the catalog subscription, with no map.info on offload.
+    const frames = await r.until(() => r.model.info()?.source === newSource, 300);
+    expect(Object.keys(r.offloadStats().byMethod).filter(m => m.startsWith("map."))).toEqual([]);
+    expect(r.model.catalog()!.revision).toBe(reload.catalog.revision);
+    expect(r.model.info()!.revision).toBe(reload.sources[0].revision);
+    await r.until(r.screenReady, 900);
+    await r.frames(30);
+    // Every drawn tile belongs to the new namespace and carries the new
+    // source's pixels; none of the old bytes survived the switch.
+    const tiles = r.model.front()!.tiles.map(t => t.input);
+    expect(tiles.every(t => t.source === newSource)).toBe(true);
+    const fresh = rasterService("2", RASTER_URL_ALT);
+    try {
+      for (const t of tiles) {
+        const expected = (await fresh.methods()["map.tile"](JSON.stringify(t)) as { pixels: Uint8Array }).pixels;
+        expect(same(r.tileBytes(t), expected)).toBe(true);
+        const old = oldBytes.get(keyOf(t));
+        if (old) expect(same(r.tileBytes(t), old)).toBe(false);
+      }
+    } finally { fresh.close(); }
+    const stats = r.relayStats()!;
+    receipt("source-replaced", { framesToCatalog: frames, oldSource, newSource, oldCatalog, newCatalog: reload.catalog.revision,
+      pushes: stats.pushes, authorityPushes: r.authorityStats()!.pushes, notFound: stats.errorCodes[RELAY_ERROR.NOT_FOUND] ?? 0,
+      tilesChecked: tiles.length, residentEntries: r.model.tiles.stats().entries, protocolErrors: stats.protocolErrors });
+    expect(r.authorityStats()!.pushes).toBeGreaterThanOrEqual(1);
+    expect(stats.protocolErrors).toBe(0);
+  } finally { r.dispose(); }
+}, 60000);
+
 async function drive(transport: Transport, backendDelayFrames: number) {
   const r = await createRig({ transport, fixture: "raster", latency: 2, deliveriesPerFrame: 8, backendDelayFrames });
   await r.until(() => !!r.model.info(), 120);
@@ -167,6 +227,9 @@ async function drive(transport: Transport, backendDelayFrames: number) {
     }
   }
   await r.frames(150);
+  // Drain the link so "no frame lost" is an equality, not an approximation:
+  // a record the rig still owes the guest is in flight, not missing.
+  await r.until(() => r.pendingDelivery() === 0 && (transport === "offload" || r.relayStats()!.pending === 0), 300);
   return { r, summary: { providerDelayFrames: backendDelayFrames, jumps, distinctTilesDemanded: demanded.size, frames: r.tick, residentEntries: r.model.tiles.stats().entries, materialized: r.uploaded().textures } };
 }
 
@@ -188,18 +251,25 @@ async function burstRelay(backendDelayFrames: number) {
       maxGuestActiveRequests: r.samples.guestActive, maxProviderActiveRequests: r.samples.providerActive, maxProviderInFlightFrames: r.samples.providerInFlightFrames, maxProviderInFlightBytes: r.samples.providerInFlightBytes, maxProviderDemandQueue: r.samples.providerDemand,
       peakStaged: s.peakStaged, peakAssemblyBytes: g.assembler!.stats().peakStagedBytes,
       negotiated: { maxPending: MAP_RELAY.rxLimits.maxPending, requestReserve: MAP_RELAY.requestReserve, slice: SLICE },
-      endState: { pending: s.pending, staged: s.staged, assemblies: g.assembler!.stats().assemblies, providerDemand: [...p.demand.values()].reduce((n, q) => n + q.length, 0), protocolErrors: s.protocolErrors + r.providerEndpoint!.protocolErrors },
+      subscriptions: g.client!.stats().subscriptions,
+      endState: { pending: s.pending, staged: s.staged, getAssemblies: g.assembler!.stats().assemblies - g.client!.stats().subscriptions, providerDemand: [...p.demand.values()].reduce((n, q) => n + q.length, 0), protocolErrors: s.protocolErrors + r.providerEndpoint!.protocolErrors },
       authority: { ...a }, provider: r.service.diagnostics() };
     expect(s.gets).toBeGreaterThanOrEqual(600);
     expect(r.samples.providerInFlightFrames).toBeLessThanOrEqual(SLICE.frames);
     expect(r.samples.providerInFlightBytes).toBeLessThanOrEqual(SLICE.bytes);
+    expect(r.samples.providerInFlightFrames).toBeLessThanOrEqual(EVIDENCE_CAP.frames);
+    expect(r.samples.providerInFlightBytes).toBeLessThanOrEqual(EVIDENCE_CAP.bytes);
     expect(r.samples.guestActive).toBeLessThanOrEqual(MAP_RELAY.rxLimits.maxPending - MAP_RELAY.requestReserve);
     expect(r.samples.providerActive).toBeLessThanOrEqual(MAP_RELAY.rxLimits.maxPending);
     expect(r.samples.providerDemand).toBeLessThanOrEqual(MAP_RELAY.rxLimits.maxPending * 3);
     // No frame lost: everything the provider sent reached the guest and vice versa; every get ended in exactly one terminal.
     expect(s.framesIn).toBe(t.toGuestFrames); expect(s.framesOut).toBe(t.toProviderFrames);
     expect(s.objects + s.notModified + s.errors).toBe(s.gets);
-    expect(summary.endState).toEqual({ pending: 0, staged: 0, assemblies: 0, providerDemand: 0, protocolErrors: 0 });
+    // Every assembly the burst reserved was released; the ones still held
+    // are the two subscription push channels (catalog + source), which
+    // outlive any get.
+    expect(summary.endState).toEqual({ pending: 0, staged: 0, getAssemblies: 0, providerDemand: 0, protocolErrors: 0 });
+    expect(summary.subscriptions).toBe(2);
     expect(r.model.tiles.stats().entries).toBeLessThanOrEqual(40);
     return summary;
   } finally { r.dispose(); }

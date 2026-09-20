@@ -43,13 +43,16 @@ export function rasterPng(z: number, x: number, y: number, epoch = "1"): Buffer 
   return canvas.toBuffer("image/png");
 }
 export const RASTER_URL = "https://tile.example.test/{z}/{x}/{y}.png";
-export function rasterService(epoch = "1"): MapService {
+/** A second tile URL: the source hash is sha([tileURL, rendition]), so this
+ * is a different namespace, not a different revision of the same one. */
+export const RASTER_URL_ALT = "https://other.example.test/{z}/{x}/{y}.png";
+export function rasterService(epoch = "1", tileURL = RASTER_URL): MapService {
   const network: NetworkFetch = async url => {
     const m = /\/(\d+)\/(\d+)\/(\d+)\.png$/.exec(String(url));
     if (!m) return new Response("not found", { status: 404 });
     return new Response(rasterPng(Number(m[1]), Number(m[2]), Number(m[3]), epoch), { headers: { "cache-control": "max-age=3600" } });
   };
-  return new MapService({ ...defaultConfig, format: "raster", tileURL: RASTER_URL, cache: ":memory:", kind: "osm", revision: epoch }, network);
+  return new MapService({ ...defaultConfig, format: "raster", tileURL, cache: ":memory:", kind: "osm", revision: epoch }, network);
 }
 export function vectorService(epoch = "1"): MapService {
   const network: NetworkFetch = async url => String(url).includes("photon")
@@ -113,30 +116,64 @@ function seededBytes(seed: number) {
   return (n: number) => { const out = new Uint8Array(n); for (let i = 0; i < n; i++) { counter = (counter * 1103515245 + 12345) >>> 0; out[i] = (counter >>> 16) & 0xff; } return out; };
 }
 
-/** A backend whose image/mesh replies can be held (a slow provider) and
- * whose service can be swapped (a reloaded host). */
-export function holdableBackend(service: MapService, delay: { frames: number; now: () => number } = { frames: 0, now: () => 0 }) {
-  const inner = inProcessBackend(service);
+/** A backend whose image/mesh replies can be held (a slow provider), whose
+ * service can be swapped (a reloaded host) and whose outstanding capability
+ * work is a barrier a test can await.
+ *
+ * `whenIdle()` is what makes the authority tests deterministic: a test waits
+ * for the exact set of promises the authority is waiting on instead of
+ * guessing a number of microtask or setImmediate hops. Held and
+ * frame-delayed replies are deliberately outside the barrier — they are the
+ * work the test is holding back — so `whenIdle()` means "everything that can
+ * finish has finished". */
+export type HoldableBackend = MapBackend & {
+  hold(on: boolean): void;
+  releaseHeld(): number;
+  calls(): number;
+  pump(): void;
+  swap(next: MapService): void;
+  /** Capability calls running now, excluding held and frame-delayed ones. */
+  outstanding(): number;
+  whenIdle(): Promise<void>;
+};
+export function holdableBackend(service: MapService, delay: { frames: number; now: () => number } = { frames: 0, now: () => 0 }): HoldableBackend {
+  let inner = inProcessBackend(service);
   const held: Array<() => void> = [];
   const delayed: Array<{ at: number; release: () => void }> = [];
-  let holding = false, calls = 0;
-  const backend: MapBackend & { hold(on: boolean): void; releaseHeld(): number; calls(): number; pump(): void } = {
+  const idle: Array<() => void> = [];
+  let holding = false, calls = 0, active = 0;
+  const track = <T>(promise: Promise<T>): Promise<T> => {
+    active++;
+    return promise.finally(() => { if (--active === 0) for (const wake of idle.splice(0)) wake(); });
+  };
+  const backend: HoldableBackend = {
     call(request: BackendRequest): Promise<BackendReply> {
       calls++;
       const reply = inner.call(request);
-      if (request.response === undefined) return reply;
-      if (holding) return new Promise(resolve => held.push(() => { reply.then(resolve); }));
+      if (request.response === undefined) return track(reply);
+      if (holding) return new Promise(resolve => held.push(() => { track(reply).then(resolve); }));
       // A provider that needs `delay.frames` frames per image/mesh (a worker decode slower than one frame).
-      if (delay.frames > 0) return new Promise(resolve => delayed.push({ at: delay.now() + delay.frames, release: () => { reply.then(resolve); } }));
-      return reply;
+      if (delay.frames > 0) return new Promise(resolve => delayed.push({ at: delay.now() + delay.frames, release: () => { track(reply).then(resolve); } }));
+      return track(reply);
     },
     close: () => {}, // the rig closes services at dispose(): a held reply may still need the old one
     hold(on) { holding = on; },
     releaseHeld() { const n = held.length; for (const release of held.splice(0)) release(); return n; },
     calls: () => calls,
     pump() { while (delayed.length && delayed[0].at <= delay.now()) delayed.shift()!.release(); },
+    swap(next) { inner = inProcessBackend(next); },
+    outstanding: () => active,
+    whenIdle: () => (active === 0 ? Promise.resolve() : new Promise<void>(resolve => idle.push(resolve))),
   };
   return backend;
+}
+
+/** Yield enough microtask checkpoints for a settled capability promise to
+ * reach the authority's `.then` chain and its frames to reach the wire. The
+ * count is the chain's fixed depth (catch → then → replyObject), not a
+ * guess at how long work takes: work is awaited through whenIdle(). */
+export async function drainMicrotasks(rounds = 8): Promise<void> {
+  for (let i = 0; i < rounds; i++) await Promise.resolve();
 }
 
 // --- rigs ------------------------------------------------------------------------
@@ -169,7 +206,7 @@ export async function createRig(options: RigOptions) {
   let tick = 0;
   const backendDelay = { frames: options.backendDelayFrames ?? 0, now: () => tick };
   let backend = holdableBackend(service, backendDelay);
-  const backends = [backend];
+  const backends: HoldableBackend[] = [backend];
   const latency = options.latency ?? 3, deliveriesPerFrame = options.deliveriesPerFrame ?? 16;
   const viewport = options.viewport ?? { width: 400, height: 240 }, tileEntries = options.tileEntries ?? 40;
 
@@ -266,7 +303,19 @@ export async function createRig(options: RigOptions) {
     model = createMap(io, viewport, tileEntries, options.transport === "relay" ? { transport: "relay", relay: client } : {});
   });
 
-  async function settle() { await new Promise<void>(resolve => setImmediate(resolve)); }
+  /** Wait on the capability promises the authority is waiting on, not on a
+   * fixed number of hops: the barrier is the rig's determinism (task 1151
+   * B6). The trailing setImmediate keeps the offload path's staged replies
+   * on the same tick boundary they had before. */
+  async function settle() {
+    for (let round = 0; round < 64; round++) {
+      if (!backends.some(b => b.outstanding() > 0)) break;
+      await Promise.all(backends.map(b => b.whenIdle()));
+      await drainMicrotasks();
+    }
+    await drainMicrotasks();
+    await new Promise<void>(resolve => setImmediate(resolve));
+  }
   async function frame(buttons = 0) {
     tick++; host.frameUploads = 0;
     for (const b of backends) b.pump();
@@ -349,6 +398,8 @@ export async function createRig(options: RigOptions) {
     get service() { return service; }, get backend() { return backend; }, get tick() { return tick; },
     frame, frames, until, screenReady, tileBytes, wireTotals, settle,
     offloadStats: () => ({ ...offload, byMethod: Object.fromEntries(offload.byMethod), staging: images.size + meshes.size }),
+    /** Records the link still owes the guest (sent, not yet delivered). */
+    pendingDelivery: () => toGuest.length,
     relayStats: () => client?.stats(),
     authorityStats: () => authority?.stats,
     /** Hold provider->guest delivery (frames queue on the link). */
@@ -371,9 +422,9 @@ export async function createRig(options: RigOptions) {
      * revision moved. The previous service keeps answering replies that
      * were already in flight (the old worker draining), as a real reload
      * would. */
-    async reload(nextEpoch: string) {
+    async reload(nextEpoch: string, make?: (epoch: string) => MapService) {
       epoch = nextEpoch;
-      service = makeService(epoch); services.push(service);
+      service = (make ?? makeService)(epoch); services.push(service);
       backend = holdableBackend(service, backendDelay); backends.push(backend);
       return authority!.refresh({ reload: true });
     },
