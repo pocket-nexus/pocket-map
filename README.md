@@ -185,31 +185,53 @@ complete local JPEG-derived atlas stays on the R5G6B5 image path.
 
 ## Relay transport (pilot)
 
-Tiles, meshes, marker windows and rendered labels can travel over
+Every map read can travel over
 [PocketJS Relay](https://github.com/pocket-stack/pocketjs/blob/main/docs/RELAY.md)
-instead of offload method calls. `map.info`, search and saved places stay on
-offload in both modes; the switch is explicit and defaults to offload.
+instead of offload method calls: the map catalog (`map.info`), tiles,
+meshes, marker windows, rendered labels and place search. Saved places are
+mutations and stay on offload in both modes (the #437 pilot order puts the
+vault last). The switch is explicit and defaults to offload.
 
 - Host: `transport: "relay"` in `.local/provider.json`, or `bun run host <3ds-ip> --relay`.
   The Mac then also listens on `relayPort` (default 8742) and the device dials
   it, presenting the same pairing key before its HELLO. The offload provider
-  keeps dialing the device for the remaining methods. `SIGHUP` re-reads the
-  provider configuration into a fresh worker and announces a moved source
-  revision to every connected device with one namespace `INVALIDATE`.
-- Guest: `createMap(io, viewport, entries, { transport: "relay", relay })`
-  with a relay map client (`app/relay.ts`) over the device's byte channel.
-  The 3DS and PSP builds have no native relay channel yet, so their compiled
-  guests keep the offload default; the relay path is exercised headless
-  (`test/relay-*.test.ts`) and over a TCP loopback.
+  keeps dialing the device for saved places, with its capability table
+  restricted to `bookmarks.list` and `bookmarks.command`. `SIGHUP` re-reads
+  the provider configuration once: the authority reads every `map.info` from
+  the new worker, swaps backend, source table and catalog in one step, sends
+  one namespace `INVALIDATE` to each subscribed stream and pushes the new
+  catalog, so the device's `map.info`, revision and namespace move together.
+- Guest: `app/transport.ts` chooses. A host that publishes the relay byte
+  lane (`globalThis.relayChannel`, `contracts/spec/relay-channel.ts`: 16,384
+  byte records, 8 slots, 2 deliveries per frame) gets a relay client built
+  over it and injected into `createMap`; a host without the lane keeps
+  offload. Both shipped entries (`app/ui.tsx`, `app/psp.tsx`) mount through
+  that factory.
+- **No host publishes the lane yet.** `hosts/3ds` and `hosts/psp` in the
+  runtime carry the offload record transport and no relay lane, so a 3DS or
+  PSP build still runs on offload. The relay path is exercised headless
+  (`test/relay-*.test.ts`) and, through the same production factory, over a
+  real TCP socket with the real worker (`test/relay-transport.test.ts`).
 
-Resource identity: `kind` tile or texture, `ns` = `map/<source hash>`,
-`key` = `z/x/y` (labels: the JSON text pair), `rendition` = `r5g6b5-v1`,
-`mesh-shortbread-v1`, `markers-<layer>-v1` or `label-r5g6b5-256x32-v1`,
+Resource identity: `kind` tile, texture or event, `ns` = `map/<source hash>`
+(the catalog lives on the control namespace `map/catalog`), `key` = `z/x/y`
+(labels: the JSON text pair; search: the canonical query tuple),
+`rendition` = `r5g6b5-v1`, `mesh-shortbread-v1`, `markers-<layer>-v1`,
+`label-r5g6b5-256x32-v1`, `search-places-v1` or `map-catalog-v1`,
 `revision` = the atlas revision or the OSM source hash extended by the
 operator `revision` epoch. A tile held with its revision revalidates with
 `ifRevision` (a `notModified` terminal instead of 131,072 bytes); a tile
 scrolled out of view is withdrawn with `CANCEL`, and a provider slower than
 one frame answers a small `CANCELLED` terminal instead of the object.
+
+Each namespace carries one latest-snapshot subscription, which is what
+binds `INVALIDATE` and catalog `PUSH` delivery: a stream that only opened
+receives neither. A codec-1 object is decoded as strict UTF-8 — an overlong
+sequence, a surrogate code point, a value above U+10FFFF or a truncated
+tail fails the entry with `INVALID` rather than reaching `JSON.parse` as a
+different, well-formed document. A provider failure carries the §3.6 code
+it declared (`shared/failure.ts`); no behaviour is selected from message
+text.
 
 ## Architecture and resource pattern
 

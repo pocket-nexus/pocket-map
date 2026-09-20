@@ -85,24 +85,37 @@ pyramid or downloads a city in advance.
 
 ## Relay transport (pilot)
 
-With `transport: "relay"` the four read paths of the lifecycle above
-(`map.tile`, `map.mesh`, `map.markers`, `map.label`) are relay resources; the
-collections, budgets and eviction are unchanged, only the loader differs.
+With `transport: "relay"` every map read is a relay resource: the catalog
+(`map.info`), the four read paths of the lifecycle above (`map.tile`,
+`map.mesh`, `map.markers`, `map.label`) and `map.search`. The collections,
+budgets and eviction are unchanged, only the loader differs. Saved places
+are mutations and stay on offload.
 
 | Piece | Offload (default) | Relay |
 | --- | --- | --- |
 | Identity | method + JSON payload, cache key `source/z/x/y` | `ResourceRef{kind, ns: map/<source>, key: z/x/y, rendition, revision}`; the cache key is the same string |
+| Catalog | `map.info` method call, re-requested on a timer | one document on the control namespace `map/catalog`, conditional on its revision |
+| Search | `map.search` method call, reply capped at 2,500 characters | `resource.get`, kind 8 (a query-scoped snapshot), the canonical query tuple as key, 8,192-byte object budget |
 | Request | `requestImage` / `requestMesh` / `request`, one credit of eight | `resource.get` with `accept`, `maxObjectBytes` and the held `ifRevision`; six of eight request slots (two reserved for control) |
-| Transfer | one 131,088-byte PIMG or PMSH record | three 65,536-byte chunks (raster), one chunk (mesh, markers, label); digest-checked, published once |
+| Transfer | one 131,088-byte PIMG or PMSH record | chunks of the negotiated wire size (three of 65,536 bytes on a socket, nine of 16,384 on a device lane); digest-checked, published once |
 | Withdrawal | callback dropped; the reply still arrives and returns credit | `CANCEL` on the sideband; the provider answers `CANCELLED/none` unless the object already entered its send queue |
-| Reconnect | every tile re-requested | every resident tile revalidated with `ifRevision`: `notModified`, about 1.1 KB per tile |
-| Source change | host restart; new source hash | one namespace-scope `INVALIDATE`; in-flight replies stamped with the old revision are fenced (`RESYNC_REQUIRED`) and resident tiles refetch |
-| Host process | `host/worker.ts` behind the offload provider | the same worker module behind `host/relay-host.ts` (`MapRelayAuthority`), TCP listener from `tools/relay-wire.ts` |
+| Reconnect | every tile re-requested | every resident tile revalidated with `ifRevision`: `notModified`, about 1.3 KB per tile |
+| Revision change | host restart; new source hash | one namespace-scope `INVALIDATE` per subscribed stream; in-flight replies stamped with the old revision are fenced (`RESYNC_REQUIRED`) and resident tiles refetch |
+| Source change | host restart; the guest re-requests `map.info` on its own timer | one catalog `PUSH`: the guest installs the new source, revision and namespace in one step |
+| Delivery binding | none | one latest-snapshot subscription per namespace; a stream that only opened receives no `INVALIDATE` and no `PUSH` |
+| Failure | English message text | the §3.6 `error.code` the provider declared (`shared/failure.ts`) |
+| Host process | `host/worker.ts` behind the offload provider | the same worker module behind `host/relay-host.ts` (`MapRelayAuthority`), TCP listener from `tools/relay-wire.ts`; the offload worker beside it answers saved places only |
 
 Namespace scope is the one invalidation the authority can send in one frame
 for a moved source: key scope would need one frame per resident key it does not
 know about, and revision scope names one concrete (key, revision). The guest
 keeps drawing the stale tiles and refetches them.
+
+A reload publishes backend, source table and catalog in one step. The
+authority reads every `map.info` from the new worker before it publishes,
+so no reader observes the old backend beside the new table; the guest then
+learns the whole new table from one catalog snapshot, so its `map.info`,
+revision and namespace cannot disagree.
 
 ## Transport recovery
 
