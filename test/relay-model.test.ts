@@ -353,3 +353,46 @@ test("consecutive source replacements retire the namespaces the catalog dropped:
     receipt("retired-namespaces", { windowBytes: MAP_RELAY.rxLimits.windowBytes, ceilingBytes: CEILING, replacements: report });
   } finally { r.dispose(); }
 }, 60000);
+
+test("a namespace bind that is in flight when the replacing catalog arrives frees its stream instead of subscribing to it", async () => {
+  const r = await createRig({ transport: "relay", fixture: "raster", latency: 2 });
+  try {
+    await r.until(() => !!r.model.info(), 120);
+    await r.until(r.screenReady, 900);
+    await r.frames(10);
+    const guest = () => r.client!.endpoint.inspect()!;
+    const namespaces = () => r.client!.endpoint.session.streamIds().map(id => r.client!.endpoint.session.streamInfo(id)!.namespace);
+    const granted = () => [...r.providerEndpoint!.inspect()!.allocations.values()].reduce((bytes, a) => bytes + a.bytes, 0);
+    const CEILING = Math.floor(MAP_RELAY.rxLimits.windowBytes / 4) + 2 * OBJECT_BYTES.catalog + SLICE.bytes;
+    const opens = () => r.relayStats()!.opens;
+    // Replacement one: the guest follows the catalog to B and sends B's OPEN.
+    const second = await r.reload("2", e => rasterService(e, RASTER_URL_ALT));
+    const sent = opens();
+    await r.until(() => opens() > sent, 300);
+    const binding = namespaceFor(second.sources[0].source);
+    // B is opening, not yet bound: the OPEN response and the third catalog
+    // now leave the authority in the same frame, so the document that drops
+    // B reaches the client before the open promise resolves.
+    expect(namespaces()).not.toContain(binding);
+    const third = await r.reload("3", e => rasterService(e, RASTER_URL_THIRD));
+    const source = third.sources[0].source;
+    await r.until(() => r.model.info()?.source === source, 300);
+    await r.until(r.screenReady, 120);
+    await r.frames(10);
+    const stats = r.relayStats()!;
+    // B's stream was opened and given back: no subscription was established
+    // on it, and its slice of the attachment window is free.
+    expect(namespaces()).toEqual([CATALOG_NS, namespaceFor(source)]);
+    expect(stats.streams).toBe(2);
+    expect(guest().client!.stats().subscriptions).toBe(2);
+    expect(granted()).toBeLessThanOrEqual(CEILING);
+    expect(stats.protocolErrors).toBe(0);
+    expect(stats.pending).toBe(0);
+    const tiles = r.model.front()!.tiles.map(t => t.input);
+    expect(tiles.length).toBe(4);
+    expect(tiles.every(t => t.source === source)).toBe(true);
+    receipt("retired-mid-bind", { binding, source, streams: namespaces(), grantedBytes: granted(),
+      subscriptions: guest().client!.stats().subscriptions, opens: stats.opens, subscribes: stats.subscribes,
+      retiredStreams: stats.retired, gets: stats.gets, objects: stats.objects, protocolErrors: stats.protocolErrors });
+  } finally { r.dispose(); }
+}, 60000);
