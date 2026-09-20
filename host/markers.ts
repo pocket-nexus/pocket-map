@@ -1,3 +1,4 @@
+import { invalid } from "../shared/failure.ts";
 import { Database } from "bun:sqlite";
 import { existsSync, renameSync, rmSync } from "node:fs";
 import { join } from "node:path";
@@ -52,7 +53,7 @@ export class MarkerIndex {
   constructor(path: string) { this.db = new Database(path, { readonly: true }); }
   query(input: MarkerInput): MapMarker[] {
     const { z, x, y, layer } = input, cells = Math.max(1, 2 ** (z - 1));
-    if (![z, x, y].every(Number.isInteger) || z < 0 || z > 7 || x < 0 || y < 0 || x >= cells || y >= cells || !["all", "travel", "collectibles", "enemies", "off"].includes(layer)) throw new Error("Invalid marker window");
+    if (![z, x, y].every(Number.isInteger) || z < 0 || z > 7 || x < 0 || y < 0 || x >= cells || y >= cells || !["all", "travel", "collectibles", "enemies", "off"].includes(layer)) throw invalid("Invalid marker window");
     if (layer === "off") return [];
     const kinds = layer === "travel" ? ["tower", "shrine", "stable", "village", "landmark", "special"] : layer === "collectibles" ? ["seed", "treasure", "special"] : layer === "enemies" ? ["enemy"] : MARKER_KINDS;
     const size = 512 / 2 ** z, x0 = x * size, y0 = y * size;

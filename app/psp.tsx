@@ -14,7 +14,8 @@ import { createOsk, Osk } from "@pocketjs/framework/osk";
 import { onFrame, onButtonPress } from "@pocketjs/framework/lifecycle";
 import { BTN } from "@pocketjs/framework/input";
 import * as hot from "@pocketjs/framework/hot";
-import { createMap, MENU, type MapModel } from "./model.ts";
+import { MENU, type MapModel } from "./model.ts";
+import { createMapForHost } from "./transport.ts";
 import { TileLayer, Annotation } from "./map-view.tsx";
 import { worldPosition } from "./geo.ts";
 const box = (x: number, y: number, w: number, h: number) => ({
@@ -61,7 +62,7 @@ function RowLabel(p: {
   );
 }
 export function PspMapApp() {
-  const s = createMap(undefined, { width: 480, height: 272 }, 24);
+  const s = createMapForHost({ width: 480, height: 272 }, 24);
   (globalThis as unknown as { __map: typeof s }).__map = s;
   const osk = createOsk({
     value: () => (s.mode() === "name" ? s.saved.name() : s.query()),

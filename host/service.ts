@@ -1,3 +1,4 @@
+import { notFound, unsupported } from "../shared/failure.ts";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { MapProvider } from "./provider.ts";
@@ -20,15 +21,15 @@ export class MapService {
   private resolve(source?: string) {
     if (source === undefined) return this.providers.get(this.selected)!; // Existing guest compatibility.
     for (const p of this.providers.values()) if (p.info.source === source) return p;
-    throw new Error("Unknown map source");
+    throw notFound("Unknown map source");
   }
   methods() { return {
     "map.info": (raw: string) => {
       const kind = JSON.parse(raw).kind ?? this.selected, p = this.providers.get(kind);
-      if (!p) throw new Error("Map is not installed on your Mac");
+      if (!p) throw notFound("Map is not installed on your Mac");
       return JSON.stringify({ ...p.info, kind, maps: [...this.providers].map(([kind, p]) => ({ kind, name: p.info.name })) });
     },
-    "map.mesh": (raw:string) => {const v=JSON.parse(raw),p=this.resolve(v.source);if(!(p instanceof MapProvider))throw new Error("This source uses raster tiles");return p.mesh(v);},
+    "map.mesh": (raw:string) => {const v=JSON.parse(raw),p=this.resolve(v.source);if(!(p instanceof MapProvider))throw unsupported("This source uses raster tiles");return p.mesh(v);},
     "map.tile": (raw: string) => { const v = JSON.parse(raw); return this.resolve(v.source).tile(v); },
     "map.search": async (raw: string) => { const v = JSON.parse(raw); return JSON.stringify(await this.resolve(v.source).search(v)); },
     "map.label": (raw: string) => this.resolve().methods()["map.label"](raw),

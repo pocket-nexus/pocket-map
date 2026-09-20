@@ -1,3 +1,4 @@
+import { busy, notFound, tooLarge, upstream } from "../shared/failure.ts";
 import { Database } from "bun:sqlite";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
@@ -17,7 +18,7 @@ export class HttpCache {
   }
   get(url: string, options: { maxBytes: number; ttl: number; signal?: AbortSignal }): Promise<Uint8Array> {
     const existing = this.pending.get(url); if (existing) return existing;
-    if (this.running >= 4) return Promise.reject(new Error("Host request budget exhausted"));
+    if (this.running >= 4) return Promise.reject(busy("Host request budget exhausted"));
     this.running++;
     const request = this.read(url, options).finally(() => { this.pending.delete(url); this.running--; });
     this.pending.set(url, request); return request;
@@ -42,15 +43,15 @@ export class HttpCache {
     let bytes: Uint8Array;
     if (response.status === 304 && row) bytes = row.bytes;
     else {
-      if (!response.ok) throw new Error(`Map service returned HTTP ${response.status}`);
-      if (Number(response.headers.get("content-length") ?? 0) > options.maxBytes) { await response.body?.cancel(); throw new Error("Map response exceeds budget"); }
-      const reader = response.body?.getReader(); if (!reader) throw new Error("Empty map response");
+      if (!response.ok) throw (response.status === 404 ? notFound(`Map service returned HTTP ${response.status}`) : upstream(`Map service returned HTTP ${response.status}`));
+      if (Number(response.headers.get("content-length") ?? 0) > options.maxBytes) { await response.body?.cancel(); throw tooLarge("Map response exceeds budget"); }
+      const reader = response.body?.getReader(); if (!reader) throw upstream("Empty map response");
       const parts: Uint8Array[] = []; let size = 0;
       try {
         while (true) {
           const part = await reader.read(); if (part.done) break;
           size += part.value.byteLength;
-          if (size > options.maxBytes) { await reader.cancel(); throw new Error("Map response exceeds budget"); }
+          if (size > options.maxBytes) { await reader.cancel(); throw tooLarge("Map response exceeds budget"); }
           parts.push(part.value);
         }
       } finally { reader.releaseLock(); }

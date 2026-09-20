@@ -1,3 +1,4 @@
+import { busy, invalid, unsupported, upstream } from "../shared/failure.ts";
 import { createHash } from "node:crypto";
 import { createCanvas, loadImage } from "@napi-rs/canvas";
 import type { OffloadImage, OffloadMesh } from "@pocketjs/framework/offload/provider";
@@ -10,7 +11,7 @@ import type { MapInfo, Place, SearchInput, TileInput } from "../shared/types.ts"
 import type { ProviderConfig } from "./config.ts";
 export { defaultConfig, type ProviderConfig } from "./config.ts";
 export function packRGB(rgba: Uint8ClampedArray | Uint8Array, width: number, height: number): OffloadImage {
-  if (rgba.byteLength !== width * height * 4) throw new Error("Invalid pixel plane");
+  if (rgba.byteLength !== width * height * 4) throw invalid("Invalid pixel plane");
   const pixels = new Uint8Array(width * height * 2);
   for (let i = 0; i < width * height; i++) {
     const alpha = rgba[i * 4 + 3] / 255;
@@ -93,7 +94,7 @@ export class MapProvider {
     };
   }
   tile(input: TileInput): Promise<OffloadImage> {
-    if (this.config.format === "vector") return Promise.reject(new Error("Use map.mesh for this vector source"));
+    if (this.config.format === "vector") return Promise.reject(unsupported("Use map.mesh for this vector source"));
     const { source, z, x, y } = input;
     if (
       source !== this.info.source ||
@@ -105,7 +106,7 @@ export class MapProvider {
       y < 0 ||
       y >= 2 ** z
     )
-      return Promise.reject(new Error("Invalid tile address or source"));
+      return Promise.reject(invalid("Invalid tile address or source"));
     const key = `${z}/${x}/${y}`,
       hit = this.decoded.get(key);
     if (hit && hit.expires > Date.now()) {
@@ -116,7 +117,7 @@ export class MapProvider {
     }
     const pending = this.loading.get(key);
     if (pending) return pending;
-    if (this.loading.size >= 3) return Promise.reject(new Error("Tile decode budget exhausted"));
+    if (this.loading.size >= 3) return Promise.reject(busy("Tile decode budget exhausted"));
     const url = this.config.tileURL.replace("{z}", String(z)).replace("{x}", String(x)).replace("{y}", String(y));
     const work = this.decode(url)
       .then((image) => {
@@ -141,7 +142,7 @@ export class MapProvider {
       x >= 2 ** z ||
       y >= 2 ** z
     )
-      return Promise.reject(new Error("Invalid vector tile address or source"));
+      return Promise.reject(invalid("Invalid vector tile address or source"));
     const key = `${z}/${x}/${y}`,
       hit = this.vectors.get(key);
     if (hit && hit.expires > Date.now()) {
@@ -152,7 +153,7 @@ export class MapProvider {
     }
     const pending = this.preparing.get(key);
     if (pending) return pending;
-    if (this.preparing.size >= 3) return Promise.reject(new Error("Vector preparation budget exhausted"));
+    if (this.preparing.size >= 3) return Promise.reject(busy("Vector preparation budget exhausted"));
     const url = this.config.tileURL.replace("{z}", String(z)).replace("{x}", String(x)).replace("{y}", String(y));
     const work = this.cache
       .get(url, { maxBytes: 2 * 1024 * 1024, ttl: 7 * 86400_000 })
@@ -181,7 +182,7 @@ export class MapProvider {
       input.x >= 2 ** input.z ||
       input.y >= 2 ** input.z
     )
-      throw new Error("Invalid label window");
+      throw invalid("Invalid label window");
     const dataZoom = Math.min(input.z, this.config.dataZoom ?? 14),
       factor = 2 ** (input.z - dataZoom),
       x = Math.floor(input.x / factor),
@@ -210,9 +211,9 @@ export class MapProvider {
       view.getUint32(16) !== 256 ||
       view.getUint32(20) !== 256
     )
-      throw new Error("Expected a 256px PNG tile");
+      throw invalid("Expected a 256px PNG tile");
     const image = await loadImage(Buffer.from(bytes));
-    if (image.width !== 256 || image.height !== 256) throw new Error("Invalid decoded tile size");
+    if (image.width !== 256 || image.height !== 256) throw invalid("Invalid decoded tile size");
     const canvas = createCanvas(256, 256),
       ctx = canvas.getContext("2d");
     ctx.drawImage(image, 0, 0);
@@ -228,10 +229,10 @@ export class MapProvider {
       !Number.isFinite(input.lon) ||
       Math.abs(input.lon) > 180
     )
-      throw new Error("Invalid place search");
+      throw invalid("Invalid place search");
     const query = input.query.trim();
     if (!query) return [];
-    if (this.searching) throw new Error("A search is already running");
+    if (this.searching) throw busy("A search is already running");
     this.searching = true;
     try {
       // Explicit submits only, at most one outgoing search per second.
@@ -245,7 +246,7 @@ export class MapProvider {
       url.searchParams.set("lon", input.lon.toFixed(1));
       const bytes = await this.cache.get(url.toString(), { maxBytes: 64 * 1024, ttl: 86400_000 });
       const result = JSON.parse(new TextDecoder().decode(bytes));
-      if (!Array.isArray(result.features)) throw new Error("Invalid search response");
+      if (!Array.isArray(result.features)) throw upstream("Invalid search response");
       const seen = new Set<string>(),
         places: Place[] = [];
       for (const feature of result.features.slice(0, 5)) {
@@ -308,7 +309,7 @@ export function renderLabel(input: { name: string; detail: string }) {
     typeof input.detail !== "string" ||
     input.detail.length > 120
   )
-    throw new Error("Invalid label");
+    throw invalid("Invalid label");
   const canvas = createCanvas(256, 32),
     c = canvas.getContext("2d");
   c.fillStyle = "#f7f9fc";

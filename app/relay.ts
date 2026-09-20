@@ -2,22 +2,30 @@ import { RelayEndpoint } from "@pocketjs/framework/relay/endpoint";
 import type { RelayPhase, RelayRandomBytes, RelayScheduler, RelayTransportAdapter } from "@pocketjs/framework/relay/session";
 import { decodeFrame } from "@pocketjs/framework/relay/frame";
 import { relayResourceKey } from "@pocketjs/framework/relay/resource";
-import { RELAY_CODEC, RELAY_ERROR, RELAY_OP, RELAY_TYPE, type RelayResourceRef } from "@pocketjs/framework/relay/spec";
+import { RELAY_CODEC, RELAY_DELIVERY, RELAY_ERROR, RELAY_OP, RELAY_TYPE, type RelayResourceRef, type RelayRxLimits } from "@pocketjs/framework/relay/spec";
 import type { ResourceLoad, ResourceResult } from "@pocketjs/framework/resource-cache";
 import type { ResourceCollectionOptions, createResourceRuntime } from "@pocketjs/framework/resource-view";
 import type { MeshResource, TextureResource } from "@pocketjs/framework/resource";
 import { getOps } from "@pocketjs/framework/host";
 import { resourcePacks } from "@pocketjs/framework/resource-pack";
-import { MAP_RELAY, OBJECT_BYTES, meshEnvelope, utf8Decode } from "../shared/relay.ts";
+import { CATALOG_NS, MAP_RELAY, MapDecodeError, OBJECT_BYTES, catalogRef, jsonTextStrict, meshEnvelope, relayRxLimits, streamWindow, type MapCatalog } from "../shared/relay.ts";
+import type { MapInfo } from "../shared/types.ts";
 
 /** One published relay object as the collections see it: the concrete
  * revision on the ref, the assembled bytes, the authority's value. */
 export interface RelayObject { ref: RelayResourceRef; data: Uint8Array; value?: unknown }
 export interface RelayInvalidation { scope: string; ns: string; ref?: RelayResourceRef; reason?: string }
+/** Every relay failure a collection sees names a §3.6 code. The message is
+ * diagnostics; no caller branches on its text. */
+export interface RelayFailure { code: string; message?: string }
+export const relayFailure = (code: string, message?: string): RelayFailure => ({ code, message });
 export interface RelayMapClientOptions {
   /** The authenticated byte channel to the companion (draft §3.1 L0). The
    * owner of the channel calls connect()/handleRecord()/disconnect(). */
   transport: RelayTransportAdapter;
+  /** Receiver guarantees to advertise; a device lane shrinks maxWireBytes
+   * and the window to what its host reserved (shared/relay.ts). */
+  rxLimits?: RelayRxLimits;
   scheduler?: RelayScheduler;
   randomBytes?: RelayRandomBytes;
   pingIntervalMs?: number;
@@ -27,25 +35,44 @@ export interface RelayMapClientOptions {
 }
 export type RelayMapClient = ReturnType<typeof createRelayMapClient>;
 
-const TRANSIENT_OPEN = new Set<string>(["BUSY", "BAD_STATE", "NOT_READY"]);
+const TRANSIENT_OPEN = new Set<string>([RELAY_ERROR.BUSY, "BAD_STATE", "NOT_READY"]);
+/** The catalog document the authority publishes; anything else is refused
+ * before it can reach installInfo. */
+function validCatalog(value: unknown): value is MapCatalog {
+  const c = value as MapCatalog | undefined;
+  return !!c && c.v === 1 && typeof c.revision === "string" && /^[a-f0-9]{16}$/.test(c.revision)
+    && Array.isArray(c.maps) && c.maps.length <= 4
+    && c.maps.every(m => !!m && typeof (m as MapInfo).source === "string");
+}
 
 /** The guest side of the map relay: one composed endpoint, one stream per
- * map namespace, gets with the held revision as ifRevision, CANCEL on
- * withdrawal, and a bounded staging table so a collection materializes from
- * a small ticket string (as it does from a native offload ticket). It owns
- * no residence: the resource collections keep the entry budget. */
+ * map namespace with one latest-snapshot subscription on it, gets with the
+ * held revision as ifRevision, CANCEL on withdrawal, and a bounded staging
+ * table so a collection materializes from a small ticket string (as it does
+ * from a native offload ticket). It owns no residence: the resource
+ * collections keep the entry budget. */
 export function createRelayMapClient(options: RelayMapClientOptions) {
+  const rxLimits = options.rxLimits ?? relayRxLimits();
   const stats = {
-    sessions: 0, opens: 0, gets: 0, busy: 0, refused: 0, cancels: 0, objects: 0, notModified: 0, errors: 0,
-    invalidates: 0, evicts: 0, protocolErrors: 0, framesIn: 0, framesOut: 0, bytesIn: 0, bytesOut: 0, staged: 0, peakStaged: 0,
+    sessions: 0, opens: 0, subscribes: 0, gets: 0, busy: 0, refused: 0, cancels: 0, objects: 0, notModified: 0, errors: 0,
+    invalidates: 0, pushes: 0, evicts: 0, protocolErrors: 0, framesIn: 0, framesOut: 0, bytesIn: 0, bytesOut: 0, staged: 0, peakStaged: 0,
     /** Published objects the scheduler released without materializing (a late or replaced result). */
     dropped: 0,
     /** Objects that arrived after the collection withdrew interest (the CANCEL lost the race, §3.6). */
     discarded: 0,
+    /** Catalog documents refused by validCatalog or strict decoding. */
+    badCatalog: 0,
     errorCodes: {} as Record<string, number>,
+    /** Namespace bindings refused, by §3.6 code: a transient code is retried
+     * on a later frame, anything else marks the namespace refused. */
+    bindRefusals: {} as Record<string, number>,
   };
-  let generation = 0, ready = false;
-  const streams = new Map<string, number>(), opening = new Set<string>(), refused = new Map<string, string>();
+  let generation = 0, ready = false, catalogStale = true;
+  /** A namespace is usable once its stream carries an established
+   * subscription: §3.6 binds INVALIDATE delivery to a subscription, so a get
+   * admitted before it could miss the fence that invalidates it. */
+  const streams = new Map<string, { stream: number; subscription: number }>();
+  const binding = new Set<string>(), refused = new Map<string, string>();
   /** Held revision per local identity, kept while a collection holds the
    * value (noteRevision on materialize, evict on dispose): the ifRevision of
    * the next get, across relay sessions. Bounded by resident entries. */
@@ -53,6 +80,7 @@ export function createRelayMapClient(options: RelayMapClientOptions) {
   const staging = new Map<number, Uint8Array>();
   let nextToken = 1;
   const listeners = new Set<(event: RelayInvalidation) => void>();
+  const catalogListeners = new Set<(catalog: MapCatalog) => void>();
   const transport: RelayTransportAdapter = {
     peer: options.transport.peer,
     trySend(bytes) {
@@ -66,7 +94,7 @@ export function createRelayMapClient(options: RelayMapClientOptions) {
     transport,
     local: {
       app: MAP_RELAY.app, versions: [[1, 0]], profiles: [{ ...MAP_RELAY.profile }],
-      codecs: [...MAP_RELAY.codecs], kinds: [...MAP_RELAY.kinds], rxLimits: { ...MAP_RELAY.rxLimits },
+      codecs: [...MAP_RELAY.codecs], kinds: [...MAP_RELAY.kinds], rxLimits,
     },
     requestReserve: MAP_RELAY.requestReserve,
     scheduler: options.scheduler, randomBytes: options.randomBytes,
@@ -74,34 +102,71 @@ export function createRelayMapClient(options: RelayMapClientOptions) {
     hooks: {
       onPhase(phase, detail) {
         if (phase === "ready") { ready = true; generation++; stats.sessions++; }
-        else if (phase === "closed" || phase === "idle") { ready = false; streams.clear(); opening.clear(); refused.clear(); }
+        else if (phase === "closed" || phase === "idle") { ready = false; streams.clear(); binding.clear(); refused.clear(); catalogStale = true; }
         options.onPhase?.(phase, detail);
       },
-      onStreamReset(stream) { for (const [ns, s] of streams) if (s === stream) streams.delete(ns); },
+      onStreamReset(stream) { for (const [ns, s] of streams) if (s.stream === stream) streams.delete(ns); },
       onProtocolError() { stats.protocolErrors++; },
     },
   });
 
-  /** The stream bound to a namespace, opening it on first use. Undefined
-   * while the session or the OPEN is not there yet (the loader declines and
+  function deliverCatalog(data: Uint8Array): void {
+    let catalog: unknown;
+    try { catalog = JSON.parse(jsonTextStrict(data)); }
+    catch { stats.badCatalog++; return; }
+    if (!validCatalog(catalog)) { stats.badCatalog++; return; }
+    catalogStale = false;
+    for (const listener of catalogListeners) listener(catalog);
+  }
+
+  /** Bind a namespace: OPEN, then one latest-snapshot subscription on the
+   * stream. Undefined while either is outstanding (the loader declines and
    * the scheduler retries next frame); a refused namespace throws so the
    * entry fails visibly instead of retrying forever. */
   function streamFor(ns: string): number | undefined {
-    const open = streams.get(ns);
-    if (open !== undefined) return open;
-    if (!ready || opening.has(ns)) return undefined;
+    const bound = streams.get(ns);
+    if (bound !== undefined) return bound.stream;
+    if (!ready || binding.has(ns)) return undefined;
     const code = refused.get(ns);
     if (code) throw new Error(`Relay namespace refused: ${code}`);
-    opening.add(ns);
+    binding.add(ns);
     const session = generation;
     stats.opens++;
-    endpoint.open({ app: MAP_RELAY.app, namespace: ns, profile: { ...MAP_RELAY.profile } }).then(
-      result => { if (generation === session && ready) streams.set(ns, result.stream); },
+    endpoint.open({ app: MAP_RELAY.app, namespace: ns, profile: { ...MAP_RELAY.profile }, rxLimits: streamWindow(rxLimits, ns) }).then(
+      result => {
+        if (generation !== session || !ready) { binding.delete(ns); return; }
+        stats.subscribes++;
+        const started = endpoint.subscribe(result.stream, { ns }, RELAY_DELIVERY.LATEST_SNAPSHOT, {
+          onObject(object) {
+            stats.pushes++;
+            if (object.ref.ns === CATALOG_NS) deliverCatalog(object.data);
+          },
+          onEnd() { streams.delete(ns); },
+        }, outcome => {
+          binding.delete(ns);
+          if (generation !== session || !ready) return;
+          if (outcome.ok && "value" in outcome && typeof outcome.value.subscription === "number") {
+            streams.set(ns, { stream: result.stream, subscription: outcome.value.subscription });
+            return;
+          }
+          const failed = (outcome as { error?: { code?: string } }).error?.code ?? RELAY_ERROR.BUSY;
+          stats.bindRefusals[failed] = (stats.bindRefusals[failed] ?? 0) + 1;
+          if (failed === RELAY_ERROR.NOT_FOUND) catalogStale = true;
+          if (!TRANSIENT_OPEN.has(failed)) refused.set(ns, failed);
+        }, { maxObjectBytes: ns === CATALOG_NS ? OBJECT_BYTES.catalog : OBJECT_BYTES.markers });
+        if (!("correlation" in started)) {
+          binding.delete(ns);
+          stats.bindRefusals[started.code] = (stats.bindRefusals[started.code] ?? 0) + 1;
+          if (!TRANSIENT_OPEN.has(started.code)) refused.set(ns, started.code);
+        }
+      },
       (error: unknown) => {
+        binding.delete(ns);
         const code = typeof error === "string" ? error : String((error as { message?: string })?.message ?? error);
+        if (code === RELAY_ERROR.NOT_FOUND) catalogStale = true;
         if (generation === session && !TRANSIENT_OPEN.has(code)) refused.set(ns, code);
       },
-    ).finally(() => opening.delete(ns));
+    );
     return undefined;
   }
 
@@ -117,6 +182,9 @@ export function createRelayMapClient(options: RelayMapClientOptions) {
         stats.errors++;
         const code = (result.error as { code?: string } | undefined)?.code ?? "unknown";
         stats.errorCodes[code] = (stats.errorCodes[code] ?? 0) + 1;
+        // The authority no longer knows this namespace: the source moved
+        // under us and the catalog this end holds is the stale half.
+        if (code === RELAY_ERROR.NOT_FOUND && ref.ns !== CATALOG_NS) catalogStale = true;
         complete({ ok: false, error: result.error }); return;
       }
       if (!("value" in result)) { complete(result); return; }
@@ -149,13 +217,17 @@ export function createRelayMapClient(options: RelayMapClientOptions) {
 
   return {
     endpoint,
-    stats: () => ({ ...stats, errorCodes: { ...stats.errorCodes }, phase: endpoint.phase, streams: streams.size, pending: endpoint.inspect()?.requests.active ?? 0 }),
+    stats: () => ({ ...stats, errorCodes: { ...stats.errorCodes }, bindRefusals: { ...stats.bindRefusals }, phase: endpoint.phase, streams: streams.size, pending: endpoint.inspect()?.requests.active ?? 0 }),
     connected: () => ready,
     /** Positive relay connection generation while READY, like offload's session(). */
     session: () => (ready ? generation : 0),
     get phase(): RelayPhase { return endpoint.phase; },
     /** The channel is up: start the §3.2 handshake. */
     connect() { if (endpoint.phase === "idle") endpoint.hello(); },
+    /** End of one lane frame: retry whatever the lane refused earlier. A
+     * device lane admits a fixed number of records per frame, so a busy
+     * outbox needs this edge to drain when nothing is arriving. */
+    step() { endpoint.flush(); },
     /** The channel dropped: every pending get fails RESYNC_REQUIRED and the
      * per-session machines are discarded; connect() starts a new session. */
     disconnect(reason: string) { endpoint.handleDisconnect(reason); },
@@ -169,6 +241,35 @@ export function createRelayMapClient(options: RelayMapClientOptions) {
       if (invalidation && ready) { stats.invalidates++; for (const listener of listeners) listener(invalidation); }
     },
     onInvalidate(listener: (event: RelayInvalidation) => void) { listeners.add(listener); return () => { listeners.delete(listener); }; },
+    /** Catalog snapshots: the answer to the first get and every later PUSH
+     * the authority sends on the catalog subscription. */
+    onCatalog(listener: (catalog: MapCatalog) => void) { catalogListeners.add(listener); return () => { catalogListeners.delete(listener); }; },
+    /** One conditional get of the catalog. False means the namespace is not
+     * bound yet and the caller should retry on a later frame; a resolved
+     * result with `catalog` absent is a notModified. */
+    requestCatalog(complete: (result: { ok: true; catalog?: MapCatalog } | { ok: false; error: RelayFailure }) => void): boolean {
+      const ref = catalogRef();
+      const started = get(ref, { accept: [RELAY_CODEC.JSON], maxObjectBytes: OBJECT_BYTES.catalog }, result => {
+        if (!result.ok) { complete({ ok: false, error: toFailure(result.error) }); return; }
+        if (!("value" in result)) { catalogStale = false; complete({ ok: true }); return; }
+        let catalog: unknown;
+        try { catalog = JSON.parse(jsonTextStrict(result.value.data)); }
+        catch (error) { stats.badCatalog++; complete({ ok: false, error: toFailure(error) }); return; }
+        if (!validCatalog(catalog)) { stats.badCatalog++; complete({ ok: false, error: relayFailure(RELAY_ERROR.INVALID, "catalog document") }); return; }
+        if (result.value.ref.revision) revisions.set(relayResourceKey(ref), result.value.ref.revision);
+        catalogStale = false;
+        for (const listener of catalogListeners) listener(catalog);
+        complete({ ok: true, catalog });
+      });
+      return started !== false;
+    },
+    /** True until a catalog document has been accepted on this session, and
+     * again once the authority answers NOT_FOUND for a map namespace: the
+     * source table this end holds no longer matches the authority's. */
+    catalogStale: () => catalogStale,
+    /** The catalog revision this end holds, so a namespace change forces a
+     * fresh document rather than a notModified. */
+    forgetCatalog() { revisions.delete(relayResourceKey(catalogRef())); catalogStale = true; },
     get,
     /** Bounded staging: a published object waits here between the transport
      * callback and the frame that materializes it. Every ticket is taken
@@ -191,6 +292,16 @@ export function createRelayMapClient(options: RelayMapClientOptions) {
     },
     heldRevision: (ref: RelayResourceRef) => revisions.get(relayResourceKey(ref)),
   };
+}
+
+/** Any failure a relay path reports, as a code the caller acts on. A
+ * MapDecodeError already carries one; a framework error carries `code`;
+ * anything else is an unclassified local fault. */
+export function toFailure(error: unknown): RelayFailure {
+  if (error instanceof MapDecodeError) return relayFailure(error.code, error.message);
+  const code = (error as { code?: unknown } | null | undefined)?.code;
+  if (typeof code === "string") return relayFailure(code, (error as { message?: string }).message);
+  return relayFailure(RELAY_ERROR.INVALID, error instanceof Error ? error.message : String(error));
 }
 
 type ImageTicket = { local: true; ticket: string } | { local: false; token: number; width: number; height: number; revision?: string };
@@ -254,7 +365,7 @@ export function createRelayImageCollection<I>(
           const width = typeof size.width === "number" ? size.width : options.width;
           const height = typeof size.height === "number" ? size.height : options.height;
           if (!Number.isInteger(width) || !Number.isInteger(height) || width < 1 || width > options.width || height < 1 || height > options.height || data.length !== width * height * 2) {
-            complete({ ok: false, error: "Relay image does not match its envelope" }); return;
+            complete({ ok: false, error: relayFailure(RELAY_ERROR.INVALID, "relay image does not match its envelope") }); return;
           }
           const ticket: ImageTicket = { local: false, token: client.stage(data), width, height, revision: ref.revision };
           complete({ ok: true, value: JSON.stringify(ticket) });
@@ -273,7 +384,7 @@ export function createRelayImageCollection<I>(
             absent.add(pack.name);
           }
           let fell = false;
-          try { fell = relay(); } catch (error) { complete({ ok: false, error }); return; }
+          try { fell = relay(); } catch (error) { complete({ ok: false, error: toFailure(error) }); return; }
           if (!fell) complete(result);
         });
         if (!id) return false;
@@ -332,7 +443,7 @@ export function createRelayMeshCollection<I>(
         if (cancelled) { if (result.ok && "value" in result) client.discard(); return; }
         if (!result.ok || !("value" in result)) { complete(result); return; }
         const envelope = meshEnvelope(result.value.data);
-        if (!envelope) { complete({ ok: false, error: "Relay mesh has an invalid envelope" }); return; }
+        if (!envelope) { complete({ ok: false, error: relayFailure(RELAY_ERROR.INVALID, "relay mesh has an invalid envelope") }); return; }
         const ticket: MeshTicket = { token: client.stage(result.value.data), width: envelope.width, height: envelope.height, revision: result.value.ref.revision };
         complete({ ok: true, value: JSON.stringify(ticket) });
       });
@@ -359,14 +470,18 @@ export function createRelayMeshCollection<I>(
   });
 }
 
-/** A bounded JSON resource (marker windows) over relay: codec 1 bytes,
- * decoded once the complete object passed its digest, parsed by the
- * collection's own materialize. No revision is held for these, so a get
- * never asks ifRevision and never sees a revalidation. */
+/** A bounded JSON resource (marker windows, place searches) over relay:
+ * codec 1 bytes, decoded as one strict UTF-8 JSON value once the complete
+ * object passed its digest (§3.4), then parsed by the collection's own
+ * materialize. A malformed object fails the entry with the §3.6 code, never
+ * with a replacement character that would parse as a different document. */
 export function relayJsonLoad<I>(client: RelayMapClient, ref: (input: I) => RelayResourceRef, maxObjectBytes: number): ResourceLoad<I, string> {
   return (input, complete) => client.get(ref(input), { accept: [RELAY_CODEC.JSON], maxObjectBytes }, result => {
     if (!result.ok || !("value" in result)) { complete(result); return; }
-    if (result.value.data.length > maxObjectBytes) { complete({ ok: false, error: "Relay object exceeds budget" }); return; }
-    complete({ ok: true, value: utf8Decode(result.value.data) });
+    if (result.value.data.length > maxObjectBytes) { complete({ ok: false, error: relayFailure(RELAY_ERROR.TOO_LARGE, "relay object exceeds budget") }); return; }
+    let text: string;
+    try { text = jsonTextStrict(result.value.data); }
+    catch (error) { complete({ ok: false, error: toFailure(error) }); return; }
+    complete({ ok: true, value: text });
   });
 }

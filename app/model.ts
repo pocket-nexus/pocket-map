@@ -5,7 +5,7 @@ import { createTileCamera } from "@pocketjs/framework/tile-viewport";
 import { offload } from "@pocketjs/framework/offload";
 import { createPackedImageCollection, resourcePacks, resourcePackStats } from "@pocketjs/framework/resource-pack";
 import { createRelayImageCollection, createRelayMeshCollection, relayJsonLoad, type RelayMapClient } from "./relay.ts";
-import { OBJECT_BYTES, RENDITION, labelRef, markerRef, namespaceFor, tileRef } from "../shared/relay.ts";
+import { CATALOG_NS, OBJECT_BYTES, RENDITION, labelRef, markerRef, namespaceFor, searchRef, tileRef, type MapCatalog } from "../shared/relay.ts";
 import { analogX, analogY, onFrame, onButtonPress } from "@pocketjs/framework/lifecycle";
 import { BTN } from "@pocketjs/framework/input";
 import { inputDeltaSeconds, simulationHz, virtualNow } from "@pocketjs/framework/clock";
@@ -24,8 +24,9 @@ export const MENU = {
 };
 export type MapTransport = "offload" | "relay";
 export interface MapOptions {
-  /** Which transport carries tiles, meshes, markers and labels. `map.info`,
-   * search and saved places stay on offload in both modes (#437 pilot scope). */
+  /** Which transport carries the map catalog (map.info), tiles, meshes,
+   * markers, labels and place search. Saved places are mutations and stay on
+   * offload in both modes (#437 pilot order: reads first, vault last). */
   transport?: MapTransport;
   /** Required for the relay transport: the guest endpoint over its byte channel. */
   relay?: RelayMapClient;
@@ -94,7 +95,8 @@ export function createMap(io = offload(), viewport = { width: 400, height: 240 }
   const backView={state:(i:TileInput)=>vector()?meshBack.state(i):rasterBack.state(i)};
   const searches = runtime.createCollection({ key: (i: SearchInput) => JSON.stringify(i), maxEntries: 4, maxViews: 1, maxDemandsPerView: 1,
     maxCost: 4 * 8192, cost: () => 8192, maxResponseBytes: 5000, retry: { attempts: 1, delayFrames: 60, maxDelayFrames: 60 },
-    load: offloadResource<SearchInput>(reads, "map.search", JSON.stringify), materialize(raw: string): Place[] {
+    load: relay ? relayJsonLoad<SearchInput>(relay, searchRef, OBJECT_BYTES.search) : offloadResource<SearchInput>(reads, "map.search", JSON.stringify),
+    materialize(raw: string): Place[] {
       const rows = JSON.parse(raw);
       if (!validPlaces(rows)) throw new Error("Invalid places response");
       return rows;
@@ -108,13 +110,20 @@ export function createMap(io = offload(), viewport = { width: 400, height: 240 }
   // the resident values, refetch them with ifRevision. The relay client has
   // already fenced the in-flight gets by generation (draft §3.8).
   const unlistenRelay = relay?.onInvalidate(event => {
+    if (event.ns === CATALOG_NS) { relay.forgetCatalog(); catalogAt = 0; return; }
     if (event.ns !== namespaceFor(info()?.source ?? "")) return;
     const key = event.scope === "namespace" ? undefined : event.ref?.key;
     tiles.invalidate(key === undefined ? undefined : i => `${i.z}/${i.x}/${i.y}` === key);
     labels.invalidate(key === undefined ? undefined : i => JSON.stringify([i.name, i.detail]) === key);
     annotations.refresh(key === undefined ? undefined : i => `${i.z}/${i.x}/${i.y}` === key);
+    searches.invalidate();
   });
-  onCleanup(() => unlistenRelay?.());
+  // A pushed catalog is the authority's atomic answer to a reload: one
+  // document carries every source and revision, so map.info and the
+  // namespace the tiles are fetched from move in the same step (§3.6
+  // latest-snapshot).
+  const unlistenCatalog = relay?.onCatalog(applyCatalog);
+  onCleanup(() => { unlistenRelay?.(); unlistenCatalog?.(); });
   const typing = () => mode() === "search" || mode() === "name";
   const listing = () => mode() === "results" || mode() === "saved";
   const rows = () => mode() === "saved" ? saved.page()?.items ?? [] : places();
@@ -136,8 +145,24 @@ export function createMap(io = offload(), viewport = { width: 400, height: 240 }
     const old = info(); if (old?.kind) remembered.set(old.kind, { ...camera.view(), pin: pin() });
     camera.stop(); if (infoRequest) io.cancel(infoRequest); infoRequest = 0;
     setSourceError(""); setRequestedKind(kind); setSwitching(true); retryAt = 0; setMode("map"); setStatus(`Opening ${kind === "hyrule" ? "Hyrule" : "OpenStreetMap"}...`);
+    // Relay: the catalog already names every installed source, so the switch
+    // needs no round trip and cannot land on a table the authority replaced.
+    if (catalog) applyCatalog(catalog);
+  }
+  /** Install the entry the requested kind names. The document is the whole
+   * table, so a source that vanished from it leaves the guest on the first
+   * entry rather than on a namespace the authority no longer serves. */
+  function applyCatalog(next: MapCatalog) {
+    catalog = next;
+    catalogAt = frame + 3600;
+    const wanted = requestedKind() ?? info()?.kind;
+    const entry = next.maps.find(m => m.kind === wanted) ?? next.maps[0];
+    if (!entry) { setSwitching(false); setStatus("No map is installed on your Mac"); return; }
+    try { installInfo({ ...entry, maps: next.maps.map(m => ({ kind: m.kind!, name: m.name })) }); }
+    catch { setSwitching(false); setRequestedKind(info()?.kind); setStatus("Unsupported map provider"); catalogAt = frame + 120; }
   }
   let frame = 0, previousSession = 0, previousLink = 0, infoRequest = 0, retryAt = 0, shiftAt = -10, levelAge = 0, candidateLevel = HOME.zoom;
+  let catalog: MapCatalog | undefined, catalogAt = 0, catalogPending = false;
   let confirmed = false;
   let bootstrap = packs ? 0 : -1;
   onCleanup(() => { if (bootstrap > 0) packs?.cancel(bootstrap); });
@@ -226,11 +251,11 @@ export function createMap(io = offload(), viewport = { width: 400, height: 240 }
   onButtonPress(BTN.RIGHT, () => { if (mode() === "saved" && !menu() && !saved.modal()) saved.turnPage(1); });
   let previousButtons = 0, zoomRepeat = 0, zoomDirection = 0;
   onFrame(buttons => {
-    frame++; const session = io.session(); setOnline(session > 0);
+    frame++; const session = io.session(); setOnline(session > 0 || (relay?.session() ?? 0) > 0);
     if (session !== previousSession) {
       if (infoRequest) { io.cancel(infoRequest); infoRequest = 0; }
       runtime.cancel(); retryAt = 0;
-      if (session > 0) { if (!relay && (!packs || !planar() || !useLocalTiles())) tiles.invalidate(); searches.invalidate(); if (!relay) labels.invalidate(); saved.refresh(); setStatus("Connecting map service"); }
+      if (session > 0) { if (!relay && (!packs || !planar() || !useLocalTiles())) tiles.invalidate(); if (!relay) { searches.invalidate(); labels.invalidate(); } saved.refresh(); setStatus("Connecting map service"); }
       else setStatus(localMapAvailable() ? "Hyrule from SD card" : "Mac disconnected - cached map");
       previousSession = session;
     }
@@ -240,7 +265,7 @@ export function createMap(io = offload(), viewport = { width: 400, height: 240 }
       // (RESYNC_REQUIRED). Resident tiles keep their revision and revalidate
       // with ifRevision: a reconnect costs one notModified terminal per
       // resident entry, not a re-transfer, unless the source moved.
-      if (link > 0) { if (!packs || !planar() || !useLocalTiles()) tiles.invalidate(); labels.invalidate(); annotations.refresh(); }
+      if (link > 0) { if (!packs || !planar() || !useLocalTiles()) tiles.invalidate(); labels.invalidate(); annotations.refresh(); searches.invalidate(); catalogAt = 0; catalogPending = false; }
       previousLink = link;
     }
     if (bootstrap === 0 && packs?.connected()) {
@@ -255,7 +280,18 @@ export function createMap(io = offload(), viewport = { width: 400, height: 240 }
         } catch { /* Optional installation; the paired provider remains available. */ }
       }) || 0;
     }
-    if (session > 0 && (bootstrap < 0 || frame >= 30 || !packs?.connected()) && !infoRequest && frame >= retryAt) {
+    if (relay?.connected() && !catalogPending && (relay.catalogStale() || frame >= catalogAt)) {
+      // One conditional get at a time; a notModified keeps the held document
+      // and the next check is an hour of frames away, not a re-parse.
+      catalogPending = relay.requestCatalog(result => {
+        catalogPending = false;
+        if (result.ok) { catalogAt = frame + 3600; return; }
+        catalogAt = frame + 120;
+        if (switching()) { setSourceError("Map unavailable. Choose again to retry."); setMode("sources"); setSwitching(false); setRequestedKind(info()?.kind); }
+        if (!info()) setStatus(`Map catalog unavailable (${result.error.code})`);
+      });
+    }
+    if (!relay && session > 0 && (bootstrap < 0 || frame >= 30 || !packs?.connected()) && !infoRequest && frame >= retryAt) {
       infoRequest = io.request("map.info", JSON.stringify({ kind: requestedKind() }), result => {
         infoRequest = 0; retryAt = frame + 3600;
         if (!result.ok) { if (switching()) { setSourceError("Map unavailable. Choose again to retry."); setMode("sources"); } setStatus(result.error); setSwitching(false); setRequestedKind(info()?.kind); retryAt = frame + 120; return; }
@@ -308,7 +344,7 @@ export function createMap(io = offload(), viewport = { width: 400, height: 240 }
     }
     if (back() && front()?.tiles.every(t => frontView.state(t.input).status === "ready")) setBack(undefined);
   });
-  return { viewport, io, transport, relay, runtime, tiles, vector, labels, frontView, backView, info, planar, online, zoomHeld, switching, sourceError, maps, choices, choosing, choose, openSources, switchMap, annotations, status, mode, setMode, query, setQuery, submitted, results, places, selection, setSelection, pin, menu, menuIndex,
+  return { viewport, io, transport, relay, runtime, tiles, vector, labels, catalog: () => catalog, frontView, backView, info, planar, online, zoomHeld, switching, sourceError, maps, choices, choosing, choose, openSources, switchMap, annotations, status, mode, setMode, query, setQuery, submitted, results, places, selection, setSelection, pin, menu, menuIndex,
     localMapAvailable, tileStorage, useLocalTiles, setLocalTiles(value: boolean) { runtime.cancel(); setUseLocalTiles(value); tiles.clear(); },
     shift, symbols, front, back, camera, saved, typing, listing, rows, selectedIndex, select, saveCurrent, lookAhead, search, openSearch, go, zoom, key, dismiss, runMenu,
     clearBack: () => setBack(undefined),
