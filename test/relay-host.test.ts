@@ -5,9 +5,9 @@ import { RELAY_CODEC, RELAY_DELIVERY, RELAY_EFFECT, RELAY_ERROR, RELAY_KIND, REL
 import type { ResourceResult } from "@pocketjs/framework/resource-cache";
 import { decodeFrame } from "@pocketjs/framework/relay/frame";
 import { MapRelayAuthority, dispatchMapCapability, providerCapabilities } from "../host/relay-host.ts";
-import { CATALOG_NS, MAP_RELAY, OBJECT_BYTES, RENDITION, catalogRef, jsonDecodeStrict, labelRef, markerRef, namespaceFor, parseMapRef, searchRef, tileRef, utf8DecodeStrict, utf8Encode } from "../shared/relay.ts";
+import { CATALOG_NS, MAP_RELAY, OBJECT_BYTES, RENDITION, catalogRef, jsonDecodeStrict, labelRef, markerRef, namespaceFor, parseMapRef, searchRef, streamWindow, tileRef, utf8DecodeStrict, utf8Encode } from "../shared/relay.ts";
 import { MapFailure, busy, failureCode, invalid, notFound } from "../shared/failure.ts";
-import { drainMicrotasks, holdableBackend, rasterService, vectorService } from "./relay-rig.ts";
+import { RASTER_URL_ALT, drainMicrotasks, holdableBackend, rasterService, vectorService } from "./relay-rig.ts";
 import type { MapService } from "../host/service.ts";
 import { defaultConfig } from "../host/config.ts";
 import { SAVED_PLACES_ONLY } from "../host/capability.ts";
@@ -54,11 +54,17 @@ async function link(service: MapService) {
   const decoded = () => frames.map(f => { const r = decodeFrame(f.bytes, { maxWireBytes: 65536 }); if (!r.ok) throw new Error(r.code); return { from: f.from, bytes: f.bytes.length, ...r.frame }; });
   const get = (stream: number, ref: RelayResourceRef, args: { accept: number[]; maxObjectBytes: number; ifRevision?: string }) =>
     new Promise<ResourceResult<unknown>>(resolve => { const started = guest.get(stream, ref, args, resolve); if (!("correlation" in started)) resolve({ ok: false, error: { code: started.code } }); });
-  const open = async (ns: string) => { const opened = await guest.open({ app: MAP_RELAY.app, namespace: ns, profile: { ...MAP_RELAY.profile } }); await settle(); return opened.stream; };
+  /** `window` divides the attachment between streams as the shipped client
+   * does (shared/relay.ts streamWindow); without it the first business
+   * stream takes the whole window and a second OPEN has no slice left. */
+  const open = async (ns: string, window = false) => {
+    const opened = await guest.open({ app: MAP_RELAY.app, namespace: ns, profile: { ...MAP_RELAY.profile }, ...(window ? { rxLimits: streamWindow(MAP_RELAY.rxLimits, ns) } : {}) });
+    await settle(); return opened.stream;
+  };
   /** Open the namespace and establish the latest-snapshot subscription the
    * authority delivers PUSH/INVALIDATE on (§3.6). */
-  const bind = async (ns: string, onPush?: (ref: RelayResourceRef, data: Uint8Array) => void) => {
-    const stream = await open(ns);
+  const bind = async (ns: string, onPush?: (ref: RelayResourceRef, data: Uint8Array) => void, window = false) => {
+    const stream = await open(ns, window);
     const subscription = await new Promise<number>((resolve, reject) => {
       const started = guest.subscribe(stream, { ns }, RELAY_DELIVERY.LATEST_SNAPSHOT,
         { onObject: object => onPush?.(object.ref, object.data) },
@@ -409,4 +415,40 @@ test("resource identity helpers", () => {
   expect(() => labelRef(input.source, { name: "語".repeat(80), detail: "語".repeat(20) })).toThrow("key bound");
   expect(() => searchRef({ query: "語".repeat(80), source: input.source, lat: 1, lon: 2 })).toThrow("key bound");
   expect(() => searchRef({ query: "x", lat: 1, lon: 2 })).toThrow("map source");
+});
+
+test("a namespace the reload dropped is retired rather than invalidated: the refresh names it, its subscribed stream receives no INVALIDATE, gets on it are NOT_FOUND, and the catalog PUSH carries the replacement", async () => {
+  const service = rasterService("1");
+  const l = await link(service);
+  // A different tile URL is a different source hash, so this is a namespace
+  // replacement (the host's SIGHUP path), not a revision move.
+  const replacement = rasterService("2", RASTER_URL_ALT);
+  try {
+    const info = JSON.parse(service.methods()["map.info"]("{}"));
+    const ns = namespaceFor(info.source);
+    const bound = await l.bind(ns, undefined, true);
+    const pushes: { ref: RelayResourceRef; data: Uint8Array }[] = [];
+    await l.bind(CATALOG_NS, (ref, data) => pushes.push({ ref, data: data.slice() }), true);
+    l.backend.swap(replacement);
+    const reloaded = await l.authority.refresh();
+    await l.settle();
+    const next = JSON.parse(replacement.methods()["map.info"]("{}"));
+    expect(next.source).not.toBe(info.source);
+    expect(reloaded.retired).toEqual([ns]);
+    expect(reloaded.changed).toEqual([ns]);
+    expect(reloaded.sources.map(s => s.ns)).toEqual([namespaceFor(next.source)]);
+    expect(l.authority.source(ns)).toBeUndefined();
+    // Nothing was announced on the retired stream: an INVALIDATE there would
+    // send the device back to keys this authority no longer serves.
+    expect(l.decoded().filter(f => f.type === RELAY_TYPE.INVALIDATE).length).toBe(0);
+    expect(l.authority.stats.invalidates).toBe(0);
+    // The replacement travels on the catalog subscription instead.
+    expect(pushes.length).toBe(1);
+    const pushed = jsonDecodeStrict(pushes[0].data) as { maps: { source: string }[] };
+    expect(pushed.maps.map(m => m.source)).toEqual([next.source]);
+    // The retired stream serves nothing: the source is gone from the table.
+    const refused = await l.get(bound.stream, tileRef({ source: info.source, z: 14, x: 2621, y: 6332 }, RENDITION.raster), { accept: [RELAY_CODEC.R5G6B5LE], maxObjectBytes: 131072 });
+    expect(refused.ok).toBe(false);
+    expect((refused as { error: { code: string } }).error.code).toBe(RELAY_ERROR.NOT_FOUND);
+  } finally { l.close(); service.close(); replacement.close(); }
 });

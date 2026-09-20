@@ -42,6 +42,10 @@ export { dispatchMapCapability } from "./capability.ts";
  * process) in production, MapService in-process in tests. */
 export interface MapBackend { call(request: BackendRequest): Promise<BackendReply>; close(): void | Promise<void> }
 export interface MapSource { ns: string; kind: MapKind; source: string; revision: string; render?: "mesh"; info: MapInfo }
+/** One refresh: `changed` is every namespace whose revision moved or that
+ * left the table; `retired` is the subset the table no longer holds, which
+ * receives no INVALIDATE and whose streams the guest frees on the catalog. */
+export interface MapRefreshResult { changed: string[]; retired: string[]; sources: MapSource[]; catalog: MapCatalog }
 export interface MapRelayConnection {
   hooks: RelayProviderHooks;
   /** The endpoint the wire adapter built for these hooks (onConnection). */
@@ -146,7 +150,7 @@ export class MapRelayAuthority {
    * together in one synchronous step. A changed or removed namespace is
    * invalidated on every subscribed stream, and every catalog subscription
    * receives the new document. */
-  async refresh(options: { reload?: boolean } = {}): Promise<{ changed: string[]; sources: MapSource[]; catalog: MapCatalog }> {
+  async refresh(options: { reload?: boolean } = {}): Promise<MapRefreshResult> {
     const rebuilt = !this.backend || options.reload === true;
     const backend = rebuilt ? await this.options.backend() : this.backend!;
     const next = new Map<string, MapSource>();
@@ -171,9 +175,12 @@ export class MapRelayAuthority {
     this.sources = next;
     this.catalog = { v: 1, revision: catalogRevision([...next.values()]), maps: [...next.values()].map(s => s.info) };
     await retired?.close();
-    for (const ns of changed) this.announceInvalidate(ns);
+    // A namespace that left the table gets no INVALIDATE: the frame would
+    // tell a device to refetch keys this authority now answers NOT_FOUND,
+    // and the catalog below carries the replacement the device follows.
+    for (const ns of changed) if (next.has(ns)) this.announceInvalidate(ns);
     if (this.catalog.revision !== previousCatalog) this.pushCatalog();
-    return { changed, sources: [...next.values()], catalog: this.catalog };
+    return { changed, retired: changed.filter(ns => !next.has(ns)), sources: [...next.values()], catalog: this.catalog };
   }
 
   /** Active subscriptions of one connection whose filter names `ns`. */
@@ -352,7 +359,7 @@ export function authenticatePairingKey(socket: Socket, key: string, timeoutMs = 
 export interface MapRelayServer {
   authority: MapRelayAuthority;
   port: number;
-  refresh(options?: { reload?: boolean }): Promise<{ changed: string[]; sources: MapSource[]; catalog: MapCatalog }>;
+  refresh(options?: { reload?: boolean }): Promise<MapRefreshResult>;
   close(): Promise<void>;
 }
 

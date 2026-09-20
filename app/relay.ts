@@ -8,7 +8,7 @@ import type { ResourceCollectionOptions, createResourceRuntime } from "@pocketjs
 import type { MeshResource, TextureResource } from "@pocketjs/framework/resource";
 import { getOps } from "@pocketjs/framework/host";
 import { resourcePacks } from "@pocketjs/framework/resource-pack";
-import { CATALOG_NS, MAP_RELAY, MapDecodeError, OBJECT_BYTES, catalogRef, jsonTextStrict, meshEnvelope, relayRxLimits, streamWindow, type MapCatalog } from "../shared/relay.ts";
+import { CATALOG_NS, MAP_RELAY, MapDecodeError, OBJECT_BYTES, catalogRef, jsonTextStrict, meshEnvelope, namespaceFor, relayRxLimits, streamWindow, type MapCatalog } from "../shared/relay.ts";
 import type { MapInfo } from "../shared/types.ts";
 
 /** One published relay object as the collections see it: the concrete
@@ -66,6 +66,8 @@ export function createRelayMapClient(options: RelayMapClientOptions) {
     /** Namespace bindings refused, by §3.6 code: a transient code is retried
      * on a later frame, anything else marks the namespace refused. */
     bindRefusals: {} as Record<string, number>,
+    /** Streams reset because the catalog stopped naming their namespace. */
+    retired: 0,
   };
   let generation = 0, ready = false, catalogStale = true;
   /** A namespace is usable once its stream carries an established
@@ -73,6 +75,13 @@ export function createRelayMapClient(options: RelayMapClientOptions) {
    * admitted before it could miss the fence that invalidates it. */
   const streams = new Map<string, { stream: number; subscription: number }>();
   const binding = new Set<string>(), refused = new Map<string, string>();
+  /** The namespaces the accepted catalog names, plus the control namespace;
+   * undefined until the first document arrives. Anything outside it is
+   * retired: the authority answers NOT_FOUND there, and the attachment
+   * window the replacement namespace needs is the slice the retired stream
+   * holds. */
+  let live: Set<string> | undefined;
+  const isLive = (ns: string) => ns === CATALOG_NS || live === undefined || live.has(ns);
   /** Held revision per local identity, kept while a collection holds the
    * value (noteRevision on materialize, evict on dispose): the ifRevision of
    * the next get, across relay sessions. Bounded by resident entries. */
@@ -102,7 +111,7 @@ export function createRelayMapClient(options: RelayMapClientOptions) {
     hooks: {
       onPhase(phase, detail) {
         if (phase === "ready") { ready = true; generation++; stats.sessions++; }
-        else if (phase === "closed" || phase === "idle") { ready = false; streams.clear(); binding.clear(); refused.clear(); catalogStale = true; }
+        else if (phase === "closed" || phase === "idle") { ready = false; streams.clear(); binding.clear(); refused.clear(); live = undefined; catalogStale = true; }
         options.onPhase?.(phase, detail);
       },
       onStreamReset(stream) { for (const [ns, s] of streams) if (s.stream === stream) streams.delete(ns); },
@@ -110,13 +119,39 @@ export function createRelayMapClient(options: RelayMapClientOptions) {
     },
   });
 
+  /** Free one namespace's stream: relay.reset fails its pending gets, ends
+   * its subscription and returns its slice of the attachment window, and
+   * the receiver drops whatever the peer already sent on it. Bounded by the
+   * streams this end opened, which §3.2 caps at eight per session. */
+  function retire(ns: string): void {
+    const bound = streams.get(ns);
+    streams.delete(ns);
+    refused.delete(ns);
+    if (bound === undefined) return;
+    stats.retired++;
+    endpoint.resetStream(bound.stream, "namespace retired");
+  }
+
+  /** One accepted catalog document is the authority's whole source table:
+   * a namespace it stopped naming was replaced or removed, so its stream
+   * retires here, before the listeners install the new source and demand
+   * tiles from it. */
+  function acceptCatalog(catalog: MapCatalog): void {
+    const next = new Set<string>([CATALOG_NS]);
+    for (const map of catalog.maps) next.add(namespaceFor(map.source));
+    live = next;
+    for (const ns of [...streams.keys()]) if (!next.has(ns)) retire(ns);
+    for (const ns of [...refused.keys()]) if (!next.has(ns)) refused.delete(ns);
+    catalogStale = false;
+    for (const listener of catalogListeners) listener(catalog);
+  }
+
   function deliverCatalog(data: Uint8Array): void {
     let catalog: unknown;
     try { catalog = JSON.parse(jsonTextStrict(data)); }
     catch { stats.badCatalog++; return; }
     if (!validCatalog(catalog)) { stats.badCatalog++; return; }
-    catalogStale = false;
-    for (const listener of catalogListeners) listener(catalog);
+    acceptCatalog(catalog);
   }
 
   /** Bind a namespace: OPEN, then one latest-snapshot subscription on the
@@ -126,7 +161,9 @@ export function createRelayMapClient(options: RelayMapClientOptions) {
   function streamFor(ns: string): number | undefined {
     const bound = streams.get(ns);
     if (bound !== undefined) return bound.stream;
-    if (!ready || binding.has(ns)) return undefined;
+    // A namespace the catalog no longer names: no stream is opened for it,
+    // so a demand the model has not dropped yet costs no window slice.
+    if (!ready || binding.has(ns) || !isLive(ns)) return undefined;
     const code = refused.get(ns);
     if (code) throw new Error(`Relay namespace refused: ${code}`);
     binding.add(ns);
@@ -135,6 +172,9 @@ export function createRelayMapClient(options: RelayMapClientOptions) {
     endpoint.open({ app: MAP_RELAY.app, namespace: ns, profile: { ...MAP_RELAY.profile }, rxLimits: streamWindow(rxLimits, ns) }).then(
       result => {
         if (generation !== session || !ready) { binding.delete(ns); return; }
+        // The catalog retired the namespace while the OPEN was in flight:
+        // give the slice back instead of subscribing to a dead source.
+        if (!isLive(ns)) { binding.delete(ns); stats.retired++; endpoint.resetStream(result.stream, "namespace retired"); return; }
         stats.subscribes++;
         const started = endpoint.subscribe(result.stream, { ns }, RELAY_DELIVERY.LATEST_SNAPSHOT, {
           onObject(object) {
@@ -145,6 +185,7 @@ export function createRelayMapClient(options: RelayMapClientOptions) {
         }, outcome => {
           binding.delete(ns);
           if (generation !== session || !ready) return;
+          if (!isLive(ns)) { stats.retired++; endpoint.resetStream(result.stream, "namespace retired"); return; }
           if (outcome.ok && "value" in outcome && typeof outcome.value.subscription === "number") {
             streams.set(ns, { stream: result.stream, subscription: outcome.value.subscription });
             return;
@@ -238,7 +279,11 @@ export function createRelayMapClient(options: RelayMapClientOptions) {
       stats.framesIn++; stats.bytesIn += bytes.length;
       const invalidation = ready && bytes.length > 48 && bytes[10] === RELAY_TYPE.INVALIDATE ? decodeInvalidation(bytes) : undefined;
       endpoint.handleRecord(bytes);
-      if (invalidation && ready) { stats.invalidates++; for (const listener of listeners) listener(invalidation); }
+      // §3.6 binds INVALIDATE delivery to a subscription: a frame for a
+      // namespace whose stream this end retired names a source the
+      // authority no longer serves, and the endpoint dropped it with the
+      // stream. It reaches no listener here either.
+      if (invalidation && ready && streams.has(invalidation.ns)) { stats.invalidates++; for (const listener of listeners) listener(invalidation); }
     },
     onInvalidate(listener: (event: RelayInvalidation) => void) { listeners.add(listener); return () => { listeners.delete(listener); }; },
     /** Catalog snapshots: the answer to the first get and every later PUSH
@@ -257,8 +302,7 @@ export function createRelayMapClient(options: RelayMapClientOptions) {
         catch (error) { stats.badCatalog++; complete({ ok: false, error: toFailure(error) }); return; }
         if (!validCatalog(catalog)) { stats.badCatalog++; complete({ ok: false, error: relayFailure(RELAY_ERROR.INVALID, "catalog document") }); return; }
         if (result.value.ref.revision) revisions.set(relayResourceKey(ref), result.value.ref.revision);
-        catalogStale = false;
-        for (const listener of catalogListeners) listener(catalog);
+        acceptCatalog(catalog);
         complete({ ok: true, catalog });
       });
       return started !== false;

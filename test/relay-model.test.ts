@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import { createRoot } from "solid-js";
 import { createResourceView } from "@pocketjs/framework/resource-view";
 import { RELAY_ERROR } from "@pocketjs/framework/relay/spec";
-import { MAP_RELAY, namespaceFor, streamWindow } from "../shared/relay.ts";
+import { CATALOG_NS, MAP_RELAY, OBJECT_BYTES, namespaceFor, streamWindow } from "../shared/relay.ts";
 import type { Place, TileInput } from "../shared/types.ts";
 import { createRig, rasterService, RASTER_URL_ALT, type Fixture, type Transport } from "./relay-rig.ts";
 
@@ -285,3 +285,71 @@ for (const providerDelay of [0, 3]) {
     if (providerDelay > 0) expect(relay.cancelledTerminals).toBeGreaterThan(relay.objectsDiscardedAfterCancel);
   }, 240000);
 }
+
+/** A third tile URL, so the rig can replace the source twice in one relay
+ * session and land on three distinct namespaces. */
+const RASTER_URL_THIRD = "https://third.example.test/{z}/{x}/{y}.png";
+
+test("consecutive source replacements retire the namespaces the catalog dropped: their streams, subscriptions and window slices come back, no invalidation is delivered for them, and each new screen is ready in a bounded number of frames", async () => {
+  const r = await createRig({ transport: "relay", fixture: "raster", latency: 2 });
+  try {
+    await r.until(() => !!r.model.info(), 120);
+    await r.until(r.screenReady, 900);
+    await r.frames(10);
+    const guest = () => r.client!.endpoint.inspect()!;
+    const namespaces = () => r.client!.endpoint.session.streamIds().map(id => r.client!.endpoint.session.streamInfo(id)!.namespace);
+    const granted = () => [...r.providerEndpoint!.inspect()!.allocations.values()].reduce((bytes, a) => bytes + a.bytes, 0);
+    // Stream 0's control quarter, the catalog stream and one map source: the
+    // ceiling a session may hold once every retired namespace is freed.
+    const CEILING = Math.floor(MAP_RELAY.rxLimits.windowBytes / 4) + 2 * OBJECT_BYTES.catalog + SLICE.bytes;
+    expect(CEILING).toBeLessThan(MAP_RELAY.rxLimits.windowBytes);
+    const report: unknown[] = [];
+    let previous = namespaceFor(r.model.info()!.source);
+    let replacements = 0;
+    for (const [epoch, url] of [["2", RASTER_URL_ALT], ["3", RASTER_URL_THIRD]] as const) {
+      replacements++;
+      const reload = await r.reload(epoch, e => rasterService(e, url));
+      const source = reload.sources[0].source, ns = namespaceFor(source);
+      // The authority drops the old namespace from the table and announces
+      // no INVALIDATE for it: the catalog carries the replacement.
+      expect(reload.retired).toEqual([previous]);
+      expect(reload.changed).toEqual([previous]);
+      expect(r.authority!.source(previous)).toBeUndefined();
+      const framesToCatalog = await r.until(() => r.model.info()?.source === source, 300);
+      const framesToScreen = await r.until(r.screenReady, 120);
+      await r.frames(10);
+      const stats = r.relayStats()!;
+      // The retired namespace kept nothing: no stream binding, no
+      // subscription, no slice of the attachment window.
+      expect(namespaces()).toEqual([CATALOG_NS, ns]);
+      expect(stats.streams).toBe(2);
+      expect(stats.retired).toBe(replacements);
+      expect(guest().client!.stats().subscriptions).toBe(2);
+      expect(granted()).toBeLessThanOrEqual(CEILING);
+      // Nothing stale reached the model or the wire: the authority sent no
+      // INVALIDATE, the client reported none, and no request is outstanding.
+      expect(r.authorityStats()!.invalidates).toBe(0);
+      expect(stats.invalidates).toBe(0);
+      expect(stats.protocolErrors).toBe(0);
+      expect(stats.bindRefusals).toEqual({});
+      expect(stats.pending).toBe(0);
+      // The screen is the new source's, byte for byte.
+      const tiles = r.model.front()!.tiles.map(t => t.input);
+      expect(tiles.length).toBe(4);
+      expect(tiles.every(t => t.source === source)).toBe(true);
+      const fresh = rasterService(epoch, url);
+      try {
+        for (const t of tiles) {
+          const expected = (await fresh.methods()["map.tile"](JSON.stringify(t)) as { pixels: Uint8Array }).pixels;
+          expect(same(r.tileBytes(t), expected)).toBe(true);
+        }
+      } finally { fresh.close(); }
+      report.push({ replacement: replacements, retired: previous, source, framesToCatalog, framesToScreen,
+        streams: namespaces(), grantedBytes: granted(), subscriptions: guest().client!.stats().subscriptions,
+        opens: stats.opens, gets: stats.gets, objects: stats.objects, retiredStreams: stats.retired,
+        invalidates: stats.invalidates, authorityInvalidates: r.authorityStats()!.invalidates, protocolErrors: stats.protocolErrors });
+      previous = ns;
+    }
+    receipt("retired-namespaces", { windowBytes: MAP_RELAY.rxLimits.windowBytes, ceilingBytes: CEILING, replacements: report });
+  } finally { r.dispose(); }
+}, 60000);
