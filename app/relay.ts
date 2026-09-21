@@ -69,7 +69,7 @@ export function createRelayMapClient(options: RelayMapClientOptions) {
     /** Streams reset because the catalog stopped naming their namespace. */
     retired: 0,
   };
-  let generation = 0, ready = false, catalogStale = true;
+  let generation = 0, bindingGeneration = 0, ready = false, catalogStale = true;
   /** A namespace is usable once its stream carries an established
    * subscription: §3.6 binds INVALIDATE delivery to a subscription, so a get
    * admitted before it could miss the fence that invalidates it. */
@@ -111,7 +111,12 @@ export function createRelayMapClient(options: RelayMapClientOptions) {
     hooks: {
       onPhase(phase, detail) {
         if (phase === "ready") { ready = true; generation++; stats.sessions++; }
-        else if (phase === "closed" || phase === "idle") { ready = false; streams.clear(); binding.clear(); refused.clear(); live = undefined; catalogStale = true; }
+        else if (phase === "closed" || phase === "idle") {
+          // Fence callbacks at teardown, before the next READY. Rejecting
+          // an old OPEN schedules a microtask that can run during HELLO.
+          bindingGeneration++;
+          ready = false; streams.clear(); binding.clear(); refused.clear(); live = undefined; catalogStale = true;
+        }
         options.onPhase?.(phase, detail);
       },
       onStreamReset(stream) { for (const [ns, s] of streams) if (s.stream === stream) streams.delete(ns); },
@@ -167,24 +172,28 @@ export function createRelayMapClient(options: RelayMapClientOptions) {
     const code = refused.get(ns);
     if (code) throw new Error(`Relay namespace refused: ${code}`);
     binding.add(ns);
-    const session = generation;
+    const session = bindingGeneration;
+    // Endpoint unbind invokes subscription callbacks before onPhase above.
+    // Check its phase too, so none can mutate map state during teardown.
+    const current = () => bindingGeneration === session && ready && endpoint.phase === "ready";
     stats.opens++;
     endpoint.open({ app: MAP_RELAY.app, namespace: ns, profile: { ...MAP_RELAY.profile }, rxLimits: streamWindow(rxLimits, ns) }).then(
       result => {
-        if (generation !== session || !ready) { binding.delete(ns); return; }
+        if (!current()) return;
         // The catalog retired the namespace while the OPEN was in flight:
         // give the slice back instead of subscribing to a dead source.
         if (!isLive(ns)) { binding.delete(ns); stats.retired++; endpoint.resetStream(result.stream, "namespace retired"); return; }
         stats.subscribes++;
         const started = endpoint.subscribe(result.stream, { ns }, RELAY_DELIVERY.LATEST_SNAPSHOT, {
           onObject(object) {
+            if (!current()) return;
             stats.pushes++;
             if (object.ref.ns === CATALOG_NS) deliverCatalog(object.data);
           },
-          onEnd() { streams.delete(ns); },
+          onEnd() { if (current() && streams.get(ns)?.stream === result.stream) streams.delete(ns); },
         }, outcome => {
+          if (!current()) return;
           binding.delete(ns);
-          if (generation !== session || !ready) return;
           if (!isLive(ns)) { stats.retired++; endpoint.resetStream(result.stream, "namespace retired"); return; }
           if (outcome.ok && "value" in outcome && typeof outcome.value.subscription === "number") {
             streams.set(ns, { stream: result.stream, subscription: outcome.value.subscription });
@@ -196,16 +205,22 @@ export function createRelayMapClient(options: RelayMapClientOptions) {
           if (!TRANSIENT_OPEN.has(failed)) refused.set(ns, failed);
         }, { maxObjectBytes: ns === CATALOG_NS ? OBJECT_BYTES.catalog : OBJECT_BYTES.markers });
         if (!("correlation" in started)) {
+          if (!current()) return;
           binding.delete(ns);
           stats.bindRefusals[started.code] = (stats.bindRefusals[started.code] ?? 0) + 1;
           if (!TRANSIENT_OPEN.has(started.code)) refused.set(ns, started.code);
         }
       },
       (error: unknown) => {
+        // This callback may outlive both disconnect and the replacement
+        // binding. It owns no state in a newer generation, including the
+        // binding marker, catalog freshness and permanent refusal table.
+        if (!current()) return;
         binding.delete(ns);
         const code = typeof error === "string" ? error : String((error as { message?: string })?.message ?? error);
+        stats.bindRefusals[code] = (stats.bindRefusals[code] ?? 0) + 1;
         if (code === RELAY_ERROR.NOT_FOUND) catalogStale = true;
-        if (generation === session && !TRANSIENT_OPEN.has(code)) refused.set(ns, code);
+        if (!TRANSIENT_OPEN.has(code)) refused.set(ns, code);
       },
     );
     return undefined;
