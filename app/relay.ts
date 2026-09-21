@@ -122,7 +122,7 @@ export function createRelayMapClient(options: RelayMapClientOptions) {
   /** Free one namespace's stream: relay.reset fails its pending gets, ends
    * its subscription and returns its slice of the attachment window, and
    * the receiver drops whatever the peer already sent on it. Bounded by the
-   * streams this end opened, which §3.2 caps at eight per session. */
+   * live streams this end opened, which §3.2 caps at eight at a time. */
   function retire(ns: string): void {
     const bound = streams.get(ns);
     streams.delete(ns);

@@ -11,7 +11,7 @@
     "deploy": "bun scripts/deploy.ts",
     "sim": "bun scripts/sim.ts",
     "prepare:hyrule": "bun scripts/prepare-hyrule.ts",
-    "test": "bun test --conditions=browser test/geo.test.ts test/provider.test.ts test/model.test.ts test/bookmarks.test.ts test/transport.test.ts test/atlas.test.ts test/navigation.test.ts test/vector.test.ts test/sd.test.ts test/storage-benchmark.test.ts test/relay-host.test.ts test/relay-model.test.ts test/relay-transport.test.ts test/relay-entry.test.ts",
+    "test": "bun test --conditions=browser test/geo.test.ts test/provider.test.ts test/model.test.ts test/bookmarks.test.ts test/transport.test.ts test/atlas.test.ts test/navigation.test.ts test/vector.test.ts test/sd.test.ts test/storage-benchmark.test.ts test/relay-host.test.ts test/relay-model.test.ts test/relay-transport.test.ts test/relay-entry.test.ts test/relay-namespace-lifetime.test.ts",
     "check": "bun run test && runtime/node_modules/.bin/tsc --noEmit",
     "psp": "bun scripts/psp.ts",
     "host:psp": "bun host/serve-usb.ts",
