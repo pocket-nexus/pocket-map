@@ -4,6 +4,8 @@ import { createOffloadImageCollection, createOffloadMeshCollection, offloadResou
 import { createTileCamera } from "@pocketjs/framework/tile-viewport";
 import { offload } from "@pocketjs/framework/offload";
 import { createPackedImageCollection, resourcePacks, resourcePackStats } from "@pocketjs/framework/resource-pack";
+import { createRelayImageCollection, createRelayMeshCollection, relayJsonLoad, type RelayMapClient } from "./relay.ts";
+import { CATALOG_NS, OBJECT_BYTES, RENDITION, labelRef, markerRef, namespaceFor, searchRef, tileRef, type MapCatalog } from "../shared/relay.ts";
 import { analogX, analogY, onFrame, onButtonPress } from "@pocketjs/framework/lifecycle";
 import { BTN } from "@pocketjs/framework/input";
 import { inputDeltaSeconds, simulationHz, virtualNow } from "@pocketjs/framework/clock";
@@ -20,9 +22,24 @@ export const MENU = {
   places: ["Search places", "Saved places", "Save map center", "Back to pin", "Map home"],
   map: ["Zoom in", "Zoom out", "Map labels", "Switch map", "Clear pin", "Retry tiles", "About & controls"],
 };
-export function createMap(io = offload(), viewport = { width: 400, height: 240 }, tileEntries = 40) {
-  // Cancelled wire requests retain offload credit until their response. Keep
-  // that queue bounded independently of active resource jobs and the SD queue.
+export type MapTransport = "offload" | "relay";
+export interface MapOptions {
+  /** Which transport carries the map catalog (map.info), tiles, meshes,
+   * markers, labels and place search. Saved places are mutations and stay on
+   * offload in both modes (#437 pilot order: reads first, vault last). */
+  transport?: MapTransport;
+  /** Required for the relay transport: the guest endpoint over its byte channel. */
+  relay?: RelayMapClient;
+}
+export function createMap(io = offload(), viewport = { width: 400, height: 240 }, tileEntries = 40, options: MapOptions = {}) {
+  const transport: MapTransport = options.transport ?? "offload";
+  const relay = transport === "relay" ? options.relay : undefined;
+  if (transport === "relay" && !relay) throw new Error("The relay transport needs a relay map client");
+  // Offload only: cancelled wire requests retain offload credit until their
+  // response, so that queue stays bounded independently of active resource
+  // jobs and the SD queue. Relay withdraws interest with CANCEL and the
+  // provider answers a small CANCELLED terminal instead of the object, so
+  // relay reads need no such gate (draft §3.6/§3.9).
   const reads = { ...io,
     request: (...args: Parameters<typeof io.request>) => io.pending() < 3 ? io.request(...args) : 0,
     requestImage: (...args: Parameters<typeof io.requestImage>) => io.pending() < 3 ? io.requestImage(...args) : 0,
@@ -48,17 +65,25 @@ export function createMap(io = offload(), viewport = { width: 400, height: 240 }
   const localMapAvailable = () => !!packs?.connected() && planar() && useLocalTiles() && localSource() === info()?.source;
   const [tileStorage, setTileStorage] = createSignal<"local" | "desktop">("desktop");
   const camera = createTileCamera({ ...viewport, x: p.x, y: p.y, zoom: HOME.zoom, minZoom: 1, maxZoom: 18, bounds: { width: 256, height: 256, wrapX: true } });
-  const runtime = createResourceRuntime({ maxConcurrent: 3, startsPerFrame: 1, completionsPerFrame: 1, maxCollections: 6, available: () => !switching() && !!info() && (io.connected() || !!packs && planar()) });
-  const rasterTiles = createPackedImageCollection<TileInput>(runtime, { key: i => `${i.source}/${i.z}/${i.x}/${i.y}`,
-    pack: i => useLocalTiles() && planar() ? { name: `hyrule-${i.source}-v1`, entry: 1 + (4 ** i.z - 1) / 3 + i.y * 2 ** i.z + i.x } : undefined,
-    fallback: { client: reads, method: "map.tile", payload: JSON.stringify }, materialized: storage => { setTileStorage(storage); if (storage === "local") setLocalSource(info()?.source); },
-    width: 256, height: 256, maxEntries: tileEntries, maxViews: 2, maxDemandsPerView: 24, retry: { attempts: 3, delayFrames: 90, maxDelayFrames: 360 } });
+  const runtime = createResourceRuntime({ maxConcurrent: 3, startsPerFrame: 1, completionsPerFrame: 1, maxCollections: 6, available: () => !switching() && !!info() && (io.connected() || !!relay?.connected() || !!packs && planar()) });
+  const tileKey = (i: TileInput) => `${i.source}/${i.z}/${i.x}/${i.y}`;
+  const tilePack = (i: TileInput) => useLocalTiles() && planar() ? { name: `hyrule-${i.source}-v1`, entry: 1 + (4 ** i.z - 1) / 3 + i.y * 2 ** i.z + i.x } : undefined;
+  const materialized = (storage: "local" | "desktop") => { setTileStorage(storage); if (storage === "local") setLocalSource(info()?.source); };
+  const tileBudget = { maxEntries: tileEntries, maxViews: 2, maxDemandsPerView: 24, retry: { attempts: 3, delayFrames: 90, maxDelayFrames: 360 } };
+  // Residence is one collection budget on both transports; relay replaces
+  // the loader only (resource.get with the held revision, CANCEL on withdrawal).
+  const rasterTiles = relay
+    ? createRelayImageCollection<TileInput>(runtime, relay, { key: tileKey, ref: i => tileRef(i, RENDITION.raster), pack: tilePack, materialized, width: 256, height: 256, ...tileBudget })
+    : createPackedImageCollection<TileInput>(runtime, { key: tileKey, pack: tilePack, fallback: { client: reads, method: "map.tile", payload: JSON.stringify }, materialized, width: 256, height: 256, ...tileBudget });
   const vector = () => info()?.render === "mesh";
-  const meshTiles = createOffloadMeshCollection(runtime, reads, {key:(i:TileInput)=>`${i.source}/${i.z}/${i.x}/${i.y}`,method:"map.mesh",payload:JSON.stringify,
-    maxEntries:tileEntries,maxViews:2,maxDemandsPerView:24,retry:{attempts:3,delayFrames:90,maxDelayFrames:360}});
-  const tiles = { invalidate(){rasterTiles.invalidate();meshTiles.invalidate();},clear(){rasterTiles.clear();meshTiles.clear();},stats:()=>vector()?meshTiles.stats():rasterTiles.stats() };
-  const labels = createOffloadImageCollection(runtime, reads, { key: (i: Place) => `${i.name}/${i.detail}`, method: "map.label", payload: i => JSON.stringify({ name: i.name, detail: i.detail }),
-    width: 256, height: 32, maxEntries: 24, maxViews: 29, maxDemandsPerView: 1 });
+  const meshTiles = relay
+    ? createRelayMeshCollection<TileInput>(runtime, relay, { key: tileKey, ref: i => tileRef(i, RENDITION.mesh), ...tileBudget })
+    : createOffloadMeshCollection(runtime, reads, { key: tileKey, method: "map.mesh", payload: JSON.stringify, ...tileBudget });
+  const tiles = { invalidate(matches?: (input: TileInput) => boolean){rasterTiles.invalidate(matches);meshTiles.invalidate(matches);},clear(){rasterTiles.clear();meshTiles.clear();},stats:()=>vector()?meshTiles.stats():rasterTiles.stats() };
+  const labelKey = (i: Place) => `${i.name}/${i.detail}`, labelBudget = { width: 256, height: 32, maxEntries: 24, maxViews: 29, maxDemandsPerView: 1 };
+  const labels = relay
+    ? createRelayImageCollection<Place>(runtime, relay, { key: labelKey, ref: i => labelRef(info()?.source ?? "", i), ...labelBudget })
+    : createOffloadImageCollection(runtime, reads, { key: labelKey, method: "map.label", payload: i => JSON.stringify({ name: i.name, detail: i.detail }), ...labelBudget });
   const [lookAhead, setLookAhead] = createSignal<DrawTile[]>([]);
   const frontDemand=()=>[...(front()?.tiles.map(t=>({input:t.input,priority:t.priority,pin:true}))??[]),...lookAhead().map(t=>({input:t.input,priority:t.priority,pin:false}))];
   const backDemand=()=>back()?.tiles.map(t=>({input:t.input,priority:100,pin:true}))??[];
@@ -70,7 +95,8 @@ export function createMap(io = offload(), viewport = { width: 400, height: 240 }
   const backView={state:(i:TileInput)=>vector()?meshBack.state(i):rasterBack.state(i)};
   const searches = runtime.createCollection({ key: (i: SearchInput) => JSON.stringify(i), maxEntries: 4, maxViews: 1, maxDemandsPerView: 1,
     maxCost: 4 * 8192, cost: () => 8192, maxResponseBytes: 5000, retry: { attempts: 1, delayFrames: 60, maxDelayFrames: 60 },
-    load: offloadResource<SearchInput>(reads, "map.search", JSON.stringify), materialize(raw: string): Place[] {
+    load: relay ? relayJsonLoad<SearchInput>(relay, searchRef, OBJECT_BYTES.search) : offloadResource<SearchInput>(reads, "map.search", JSON.stringify),
+    materialize(raw: string): Place[] {
       const rows = JSON.parse(raw);
       if (!validPlaces(rows)) throw new Error("Invalid places response");
       return rows;
@@ -79,7 +105,25 @@ export function createMap(io = offload(), viewport = { width: 400, height: 240 }
   const results = createResourceView(searches, { demand: () => submitted() ? [{ input: submitted()!, priority: -10, pin: true }] : [] });
   const places = createMemo(() => submitted() ? results.value(submitted()!) ?? [] : []);
   const saved = createSavedPlaces(io, runtime, mode, setMode, () => info()?.source, reads);
-  const annotations = createAnnotations(reads, runtime, viewport), prediction = createMapPrediction(viewport);
+  const annotations = createAnnotations(reads, runtime, viewport, relay ? relayJsonLoad(relay, markerRef, OBJECT_BYTES.markers) : undefined), prediction = createMapPrediction(viewport);
+  // An authority INVALIDATE (a moved source or atlas revision): keep drawing
+  // the resident values, refetch them with ifRevision. The relay client has
+  // already fenced the in-flight gets by generation (draft §3.8).
+  const unlistenRelay = relay?.onInvalidate(event => {
+    if (event.ns === CATALOG_NS) { relay.forgetCatalog(); catalogAt = 0; return; }
+    if (event.ns !== namespaceFor(info()?.source ?? "")) return;
+    const key = event.scope === "namespace" ? undefined : event.ref?.key;
+    tiles.invalidate(key === undefined ? undefined : i => `${i.z}/${i.x}/${i.y}` === key);
+    labels.invalidate(key === undefined ? undefined : i => JSON.stringify([i.name, i.detail]) === key);
+    annotations.refresh(key === undefined ? undefined : i => `${i.z}/${i.x}/${i.y}` === key);
+    searches.invalidate();
+  });
+  // A pushed catalog is the authority's atomic answer to a reload: one
+  // document carries every source and revision, so map.info and the
+  // namespace the tiles are fetched from move in the same step (§3.6
+  // latest-snapshot).
+  const unlistenCatalog = relay?.onCatalog(applyCatalog);
+  onCleanup(() => { unlistenRelay?.(); unlistenCatalog?.(); });
   const typing = () => mode() === "search" || mode() === "name";
   const listing = () => mode() === "results" || mode() === "saved";
   const rows = () => mode() === "saved" ? saved.page()?.items ?? [] : places();
@@ -101,8 +145,24 @@ export function createMap(io = offload(), viewport = { width: 400, height: 240 }
     const old = info(); if (old?.kind) remembered.set(old.kind, { ...camera.view(), pin: pin() });
     camera.stop(); if (infoRequest) io.cancel(infoRequest); infoRequest = 0;
     setSourceError(""); setRequestedKind(kind); setSwitching(true); retryAt = 0; setMode("map"); setStatus(`Opening ${kind === "hyrule" ? "Hyrule" : "OpenStreetMap"}...`);
+    // Relay: the catalog already names every installed source, so the switch
+    // needs no round trip and cannot land on a table the authority replaced.
+    if (catalog) applyCatalog(catalog);
   }
-  let frame = 0, previousSession = 0, infoRequest = 0, retryAt = 0, shiftAt = -10, levelAge = 0, candidateLevel = HOME.zoom;
+  /** Install the entry the requested kind names. The document is the whole
+   * table, so a source that vanished from it leaves the guest on the first
+   * entry rather than on a namespace the authority no longer serves. */
+  function applyCatalog(next: MapCatalog) {
+    catalog = next;
+    catalogAt = frame + 3600;
+    const wanted = requestedKind() ?? info()?.kind;
+    const entry = next.maps.find(m => m.kind === wanted) ?? next.maps[0];
+    if (!entry) { setSwitching(false); setStatus("No map is installed on your Mac"); return; }
+    try { installInfo({ ...entry, maps: next.maps.map(m => ({ kind: m.kind!, name: m.name })) }); }
+    catch { setSwitching(false); setRequestedKind(info()?.kind); setStatus("Unsupported map provider"); catalogAt = frame + 120; }
+  }
+  let frame = 0, previousSession = 0, previousLink = 0, infoRequest = 0, retryAt = 0, shiftAt = -10, levelAge = 0, candidateLevel = HOME.zoom;
+  let catalog: MapCatalog | undefined, catalogAt = 0, catalogPending = false;
   let confirmed = false;
   let bootstrap = packs ? 0 : -1;
   onCleanup(() => { if (bootstrap > 0) packs?.cancel(bootstrap); });
@@ -191,13 +251,22 @@ export function createMap(io = offload(), viewport = { width: 400, height: 240 }
   onButtonPress(BTN.RIGHT, () => { if (mode() === "saved" && !menu() && !saved.modal()) saved.turnPage(1); });
   let previousButtons = 0, zoomRepeat = 0, zoomDirection = 0;
   onFrame(buttons => {
-    frame++; const session = io.session(); setOnline(session > 0);
+    frame++; const session = io.session(); setOnline(session > 0 || (relay?.session() ?? 0) > 0);
     if (session !== previousSession) {
       if (infoRequest) { io.cancel(infoRequest); infoRequest = 0; }
       runtime.cancel(); retryAt = 0;
-      if (session > 0) { if (!packs || !planar() || !useLocalTiles()) tiles.invalidate(); searches.invalidate(); labels.invalidate(); saved.refresh(); setStatus("Connecting map service"); }
+      if (session > 0) { if (!relay && (!packs || !planar() || !useLocalTiles())) tiles.invalidate(); if (!relay) { searches.invalidate(); labels.invalidate(); } saved.refresh(); setStatus("Connecting map service"); }
       else setStatus(localMapAvailable() ? "Hyrule from SD card" : "Mac disconnected - cached map");
       previousSession = session;
+    }
+    const link = relay?.session() ?? 0;
+    if (relay && link !== previousLink) {
+      // A new relay session already failed every in-flight get on its own
+      // (RESYNC_REQUIRED). Resident tiles keep their revision and revalidate
+      // with ifRevision: a reconnect costs one notModified terminal per
+      // resident entry, not a re-transfer, unless the source moved.
+      if (link > 0) { if (!packs || !planar() || !useLocalTiles()) tiles.invalidate(); labels.invalidate(); annotations.refresh(); searches.invalidate(); catalogAt = 0; catalogPending = false; }
+      previousLink = link;
     }
     if (bootstrap === 0 && packs?.connected()) {
       bootstrap = packs.request("pack.read", "hyrule/0", result => {
@@ -211,7 +280,18 @@ export function createMap(io = offload(), viewport = { width: 400, height: 240 }
         } catch { /* Optional installation; the paired provider remains available. */ }
       }) || 0;
     }
-    if (session > 0 && (bootstrap < 0 || frame >= 30 || !packs?.connected()) && !infoRequest && frame >= retryAt) {
+    if (relay?.connected() && !catalogPending && (relay.catalogStale() || frame >= catalogAt)) {
+      // One conditional get at a time; a notModified keeps the held document
+      // and the next check is an hour of frames away, not a re-parse.
+      catalogPending = relay.requestCatalog(result => {
+        catalogPending = false;
+        if (result.ok) { catalogAt = frame + 3600; return; }
+        catalogAt = frame + 120;
+        if (switching()) { setSourceError("Map unavailable. Choose again to retry."); setMode("sources"); setSwitching(false); setRequestedKind(info()?.kind); }
+        if (!info()) setStatus(`Map catalog unavailable (${result.error.code})`);
+      });
+    }
+    if (!relay && session > 0 && (bootstrap < 0 || frame >= 30 || !packs?.connected()) && !infoRequest && frame >= retryAt) {
       infoRequest = io.request("map.info", JSON.stringify({ kind: requestedKind() }), result => {
         infoRequest = 0; retryAt = frame + 3600;
         if (!result.ok) { if (switching()) { setSourceError("Map unavailable. Choose again to retry."); setMode("sources"); } setStatus(result.error); setSwitching(false); setRequestedKind(info()?.kind); retryAt = frame + 120; return; }
@@ -264,11 +344,11 @@ export function createMap(io = offload(), viewport = { width: 400, height: 240 }
     }
     if (back() && front()?.tiles.every(t => frontView.state(t.input).status === "ready")) setBack(undefined);
   });
-  return { viewport, io, runtime, tiles, vector, labels, frontView, backView, info, planar, online, zoomHeld, switching, sourceError, maps, choices, choosing, choose, openSources, switchMap, annotations, status, mode, setMode, query, setQuery, submitted, results, places, selection, setSelection, pin, menu, menuIndex,
+  return { viewport, io, transport, relay, runtime, tiles, vector, labels, catalog: () => catalog, frontView, backView, info, planar, online, zoomHeld, switching, sourceError, maps, choices, choosing, choose, openSources, switchMap, annotations, status, mode, setMode, query, setQuery, submitted, results, places, selection, setSelection, pin, menu, menuIndex,
     localMapAvailable, tileStorage, useLocalTiles, setLocalTiles(value: boolean) { runtime.cancel(); setUseLocalTiles(value); tiles.clear(); },
     shift, symbols, front, back, camera, saved, typing, listing, rows, selectedIndex, select, saveCurrent, lookAhead, search, openSearch, go, zoom, key, dismiss, runMenu,
     clearBack: () => setBack(undefined),
-    diagnostics: () => ({ frame, pending: io.pending(), resources: runtime.stats(), tiles: tiles.stats(), camera: camera.view(), pack: resourcePackStats(), storage: tileStorage() }),
+    diagnostics: () => ({ frame, transport, pending: io.pending(), resources: runtime.stats(), tiles: tiles.stats(), camera: camera.view(), pack: resourcePackStats(), storage: tileStorage(), relay: relay?.stats() }),
   };
 }
 export type MapModel = ReturnType<typeof createMap>;

@@ -8,7 +8,8 @@ import { inputDeltaSeconds } from "@pocketjs/framework/clock";
 import { onFrame } from "@pocketjs/framework/lifecycle";
 import * as hot from "@pocketjs/framework/hot";
 import {labelWidth,labelMetrics} from "./annotations.ts";
-import { createMap, MENU, type MapModel, type Layer } from "./model.ts";
+import { MENU, type MapModel, type Layer } from "./model.ts";
+import { createMapForHost } from "./transport.ts";
 import { worldPosition, unproject, scaleBar } from "./geo.ts";
 import type { Place, MapMarker } from "../shared/types.ts";
 import { TileLayer, Annotation } from "./map-view.tsx";
@@ -144,7 +145,7 @@ function Deck(p: { s: MapModel }) {
 }
 
 export default function MapApp() {
-  const s = createMap(); (globalThis as unknown as { __map: MapModel }).__map = s;
+  const s = createMapForHost(); (globalThis as unknown as { __map: MapModel }).__map = s;
   let marker: NodeMirror | undefined, bar: NodeMirror | undefined, scaleText: NodeMirror | undefined, zoomText: NodeMirror | undefined;
   onFrame(() => {
     const v = s.camera.view(), pin = s.pin();

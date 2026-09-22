@@ -1,3 +1,4 @@
+import { invalid, tooLarge } from "../shared/failure.ts";
 import { VectorTile, classifyRings, type VectorTileFeature } from "@mapbox/vector-tile";
 import { PbfReader } from "pbf";
 import earcut from "earcut";
@@ -324,20 +325,20 @@ function roadWidth(kind: string, z: number) {
           : 0.5;
 }
 export function prepareVector(bytes: Uint8Array, z: number): PreparedTile {
-  if (bytes.length > 2 * 1024 * 1024) throw new Error("Vector source body exceeds budget");
+  if (bytes.length > 2 * 1024 * 1024) throw tooLarge("Vector source body exceeds budget");
   const tile = new VectorTile(new PbfReader(bytes)),
     features: Feature[] = [],
     labels: VectorLabel[] = [];
   let total = 0;
   for (const [name, layer] of Object.entries(tile.layers)) {
     if (![...AREAS, ...LINES, "place_labels", "street_labels", "pois"].includes(name)) continue;
-    if (layer.length > 20000) throw new Error("Vector feature budget exceeded");
+    if (layer.length > 20000) throw tooLarge("Vector feature budget exceeded");
     for (let i = 0; i < layer.length; i++) {
       const f = layer.feature(i),
         geometry = f.loadGeometry();
       total += geometry.reduce((n, r) => n + r.length, 0);
-      if (total > 200000) throw new Error("Vector point budget exceeded");
-      if (!Number.isInteger(f.extent) || f.extent < 1 || f.extent > 65536) throw new Error("Invalid vector extent");
+      if (total > 200000) throw tooLarge("Vector point budget exceeded");
+      if (!Number.isInteger(f.extent) || f.extent < 1 || f.extent > 65536) throw invalid("Invalid vector extent");
       const scale = 256 / f.extent,
         rings = geometry.map((r) => r.map((p) => ({ x: p.x * scale, y: p.y * scale })));
       if (
@@ -347,7 +348,7 @@ export function prepareVector(bytes: Uint8Array, z: number): PreparedTile {
           ),
         )
       )
-        throw new Error("Invalid vector coordinates");
+        throw invalid("Invalid vector coordinates");
       const kind = String(f.properties.kind ?? ""),
         properties = f.properties;
       if (name.includes("labels") || name === "pois") {
@@ -476,7 +477,7 @@ export function prepareVector(bytes: Uint8Array, z: number): PreparedTile {
       };
     }
   }
-  throw new Error("Vector tile cannot fit the device detail budget");
+  throw tooLarge("Vector tile cannot fit the device detail budget");
 }
 
 /** Choose stable anchors within a requested display tile. A z18 label window

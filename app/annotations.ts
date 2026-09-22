@@ -1,6 +1,7 @@
 import { createMemo, createSignal } from "solid-js";
 import { createResourceView, type createResourceRuntime } from "@pocketjs/framework/resource-view";
 import { offloadResource } from "@pocketjs/framework/resource-offload";
+import type { ResourceLoad } from "@pocketjs/framework/resource-cache";
 import { getOps } from "@pocketjs/framework/host";
 import { visibleTiles } from "@pocketjs/framework/tile-viewport";
 import type { offload } from "@pocketjs/framework/offload";
@@ -29,7 +30,9 @@ export function labelMetrics(name: string) {
   return result;
 }
 export const labelWidth = (name: string) => labelMetrics(name).width;
-export function createAnnotations(io: ReturnType<typeof offload>, runtime: ReturnType<typeof createResourceRuntime>, viewport = { width: 400, height: 240 }) {
+/** `load` replaces the offload `map.markers` read with another transport's
+ * loader (relay resource.get); the window budget and validation stay. */
+export function createAnnotations(io: ReturnType<typeof offload>, runtime: ReturnType<typeof createResourceRuntime>, viewport = { width: 400, height: 240 }, load?: ResourceLoad<MarkerInput, string>) {
   const [layer, setLayer] = createSignal<MarkerLayer>("all"),
     [demand, setDemand] = createSignal<MarkerInput[]>([]);
   const collection = runtime.createCollection({
@@ -40,7 +43,7 @@ export function createAnnotations(io: ReturnType<typeof offload>, runtime: Retur
     cost: () => 8192,
     maxCost: 40 * 8192,
     maxResponseBytes: 5000,
-    load: offloadResource<MarkerInput>(io, "map.markers", JSON.stringify),
+    load: load ?? offloadResource<MarkerInput>(io, "map.markers", JSON.stringify),
     materialize(raw: string): MapMarker[] {
       const rows = JSON.parse(raw);
       if (
@@ -85,6 +88,9 @@ export function createAnnotations(io: ReturnType<typeof offload>, runtime: Retur
       setDemand([]); setRenderRows([]); placements.clear(); last = undefined; demandAt = undefined;
       collection.clear();
     },
+    /** Keep the resident windows visible and refetch them (authority
+     * invalidation or a new relay session). */
+    refresh(matches?: (input: MarkerInput) => boolean) { collection.invalidate(matches); },
     update(camera: { x: number; y: number; zoom: number }, level: number, info: MapInfo) {
       if (info.render === "mesh") level = Math.min(info.maxZoom, Math.max(0, Math.round(camera.zoom)));
       const vector = info.render === "mesh",
