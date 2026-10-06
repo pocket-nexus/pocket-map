@@ -1,6 +1,6 @@
 # Pocket Map
 
-A map browser for Nintendo 3DS and PSP, built with [PocketJS](https://github.com/pocket-stack/pocketjs) and SolidJS 1.9. Browse **OSM vector maps** or the complete Hyrule map from **The Legend of Zelda: Breath of the Wild**. Pan with the resistive touchpad, zoom, search and save places on the paired Mac.
+A map browser for Nintendo 3DS and PSP, built with [PocketJS](https://github.com/pocket-nexus/pocketjs) and SolidJS 1.9. Browse **OSM vector maps** or the complete Hyrule map from **The Legend of Zelda: Breath of the Wild**. Pan with the resistive touchpad, zoom, search and save places on the paired Mac.
 
 The Mac fetches OSM vector tiles, prepares bounded geometry and streams it to the 3DS GPU drawing path. Four real San Francisco tiles used **79.5% fewer terrain bytes** than the previous raw bitmap path; z14 geometry is reused through display z18. Hyrule retains its complete local raster atlas and 2,576 searchable places, with no internet requests while browsing. See [vector architecture, measurements and limits](docs/VECTOR_MAP.md).
 
@@ -32,7 +32,7 @@ The PSP port renders the same OSM vector geometry on its local GE, with a 480×2
 Requirements: Bun 1.3.14, Docker with the PocketJS 3DS toolchain (or a supported native devkitPro install), Git, a Mac and a 3DS on the same LAN, Homebrew Launcher and ftpd. The runtime submodule pins the mesh and image resource support used by this app.
 
 ```sh
-git clone --recurse-submodules https://github.com/pocket-stack/pocket-map.git
+git clone --recurse-submodules https://github.com/pocket-nexus/pocket-map.git
 cd pocket-map
 cd runtime && bun install --frozen-lockfile && cd ..
 bun install --frozen-lockfile
